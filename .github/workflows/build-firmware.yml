@@ -4,14 +4,10 @@
 # Repo:  dgvinc/edge-firmware  (private)
 # Place: .github/workflows/build-firmware.yml
 #
-# What it does:
-#   push to main     → compiles v4/Code-Glasses, uploads .bin artifact
-#   push tag v*.*.*  → same + creates GitHub Release with all binaries
+# Triggers:
+#   push to main     → compiles, uploads .bin artifact
+#   push tag v*.*.*  → same + creates GitHub Release
 #   manual trigger   → same as push to main
-#
-# Creating a release:
-#   git tag v1.0.0
-#   git push origin v1.0.0
 # ──────────────────────────────────────────────────────────────────
 
 name: Build Firmware
@@ -33,17 +29,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Compile with ESP-IDF v5.5.1 ────────────────────────────
-      # Uses Espressif's official Docker-based CI action
-      # path = folder containing CMakeLists.txt and main/
+      # The command runs INSIDE the Docker container at the correct path.
+      # rm -rf build purges any stale Windows CMake cache that was committed.
+      # Then set-target + build creates everything fresh.
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.5.1
-          target: esp32
           path: v4/Code-Glasses
+          command: rm -rf build && idf.py set-target esp32 && idf.py build
 
-      # ── Build metadata ──────────────────────────────────────────
       - name: Get build info
         id: info
         run: |
@@ -51,8 +46,6 @@ jobs:
           echo "size=$(stat -c%s "$BIN" 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
           echo "date=$(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_OUTPUT
 
-      # ── Upload artifact (every build) ───────────────────────────
-      # Available from the Actions tab → workflow run → Artifacts
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -63,7 +56,6 @@ jobs:
             v4/Code-Glasses/build/partition_table/partition-table.bin
           retention-days: 90
 
-      # ── GitHub Release (only on version tags) ───────────────────
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
