@@ -1,1 +1,93 @@
+# ──────────────────────────────────────────────────────────────────
+# EDGE Smart Glasses — Firmware CI/CD
+# ──────────────────────────────────────────────────────────────────
+# Repo:  dgvinc/edge-firmware  (private)
+# Place: .github/workflows/build-firmware.yml
+#
+# What it does:
+#   push to main     → compiles v4/Code-Glasses, uploads .bin artifact
+#   push tag v*.*.*  → same + creates GitHub Release with all binaries
+#   manual trigger   → same as push to main
+#
+# Creating a release:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+# ──────────────────────────────────────────────────────────────────
 
+name: Build Firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile ESP32 Firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Compile with ESP-IDF v5.5.1 ────────────────────────────
+      # Uses Espressif's official Docker-based CI action
+      # path = folder containing CMakeLists.txt and main/
+      - name: Build with ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.1
+          target: esp32
+          path: v4/Code-Glasses
+
+      # ── Build metadata ──────────────────────────────────────────
+      - name: Get build info
+        id: info
+        run: |
+          BIN="v4/Code-Glasses/build/ESP32_Ble.bin"
+          echo "size=$(stat -c%s "$BIN" 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_OUTPUT
+
+      # ── Upload artifact (every build) ───────────────────────────
+      # Available from the Actions tab → workflow run → Artifacts
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-esp32
+          path: |
+            v4/Code-Glasses/build/ESP32_Ble.bin
+            v4/Code-Glasses/build/bootloader/bootloader.bin
+            v4/Code-Glasses/build/partition_table/partition-table.bin
+          retention-days: 90
+
+      # ── GitHub Release (only on version tags) ───────────────────
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Firmware ${{ github.ref_name }}"
+          body: |
+            ## EDGE Firmware ${{ github.ref_name }}
+
+            **Built:** ${{ steps.info.outputs.date }}
+            **Size:** ${{ steps.info.outputs.size }} bytes
+            **Target:** ESP32 (ESP-IDF v5.5.1)
+
+            ### OTA Update
+            Download `ESP32_Ble.bin` → open the OTA Updater → Connect → Flash.
+
+            ### Wired Flash (first time only)
+            | File | Address |
+            |------|---------|
+            | bootloader.bin | 0x1000 |
+            | partition-table.bin | 0x8000 |
+            | ESP32_Ble.bin | 0x10000 |
+          files: |
+            v4/Code-Glasses/build/ESP32_Ble.bin
+            v4/Code-Glasses/build/bootloader/bootloader.bin
+            v4/Code-Glasses/build/partition_table/partition-table.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
