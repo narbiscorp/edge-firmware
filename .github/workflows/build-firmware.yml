@@ -1,13 +1,15 @@
 # ──────────────────────────────────────────────────────────────────
 # EDGE Smart Glasses — Firmware CI/CD
 # ──────────────────────────────────────────────────────────────────
-# Repo:  dgvinc/edge-firmware  (private)
+# Repo:  dgvinc/edge-firmware
 # Place: .github/workflows/build-firmware.yml
 #
-# Triggers:
-#   push to main     → compiles, uploads .bin artifact
-#   push tag v*.*.*  → same + creates GitHub Release
-#   manual trigger   → same as push to main
+# Every push to main:
+#   1. Compiles firmware
+#   2. Auto-creates a GitHub Release with the .bin files
+#
+# Version format: v2026.03.05-abc1234 (date + short commit hash)
+# Manual tags (v1.0.0 etc) also trigger a release with that tag name.
 # ──────────────────────────────────────────────────────────────────
 
 name: Build Firmware
@@ -22,16 +24,13 @@ on:
 
 jobs:
   build:
-    name: Compile ESP32 Firmware
+    name: Compile & Release
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The command runs INSIDE the Docker container at the correct path.
-      # rm -rf build purges any stale Windows CMake cache that was committed.
-      # Then set-target + build creates everything fresh.
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
@@ -39,12 +38,24 @@ jobs:
           path: v4/Code-Glasses
           command: rm -rf build && idf.py set-target esp32 && idf.py build
 
-      - name: Get build info
+      - name: Build info
         id: info
         run: |
           BIN="v4/Code-Glasses/build/ESP32_Ble.bin"
           echo "size=$(stat -c%s "$BIN" 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
           echo "date=$(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_OUTPUT
+
+          # Auto-generate version tag: v2026.03.05-abc1234
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          AUTO_TAG="v$(date -u +'%Y.%m.%d')-${SHORT_SHA}"
+          echo "auto_tag=${AUTO_TAG}" >> $GITHUB_OUTPUT
+
+          # Use manual tag if present, otherwise auto-tag
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${AUTO_TAG}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -56,20 +67,23 @@ jobs:
             v4/Code-Glasses/build/partition_table/partition-table.bin
           retention-days: 90
 
+      # Auto-release on every push to main (skip for PRs)
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          name: "Firmware ${{ github.ref_name }}"
+          tag_name: ${{ steps.info.outputs.tag }}
+          name: "Firmware ${{ steps.info.outputs.tag }}"
           body: |
-            ## EDGE Firmware ${{ github.ref_name }}
+            ## EDGE Firmware ${{ steps.info.outputs.tag }}
 
             **Built:** ${{ steps.info.outputs.date }}
             **Size:** ${{ steps.info.outputs.size }} bytes
+            **Commit:** ${{ github.sha }}
             **Target:** ESP32 (ESP-IDF v5.5.1)
 
             ### OTA Update
-            Download `ESP32_Ble.bin` → open the OTA Updater → Connect → Flash.
+            Download `ESP32_Ble.bin` → open OTA Updater → Connect → Flash.
 
             ### Wired Flash (first time only)
             | File | Address |
