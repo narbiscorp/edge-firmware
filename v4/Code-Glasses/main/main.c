@@ -1062,7 +1062,7 @@ static const char *TAG = "SG_v4.14.15";
  * Flip to 0 for production flashes. Leave at 1 while bringing up PPG
  * or doing bench-side firmware work.
  ******************************************************************************/
-#define TEST_MODE               1
+#define TEST_MODE               0
 
 /* Back-compat alias. The original v4.12.0 flag name is referenced in many
  * #if blocks throughout this file; keeping the alias means TEST_MODE is the
