@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Smart Glasses Firmware v4.14.38
+ * Smart Glasses Firmware v4.14.39
  *
  * Current build: ESP32-based Narbis Edge firmware with PPG heartbeat
  * detection, on-device HRV frequency-domain analysis (coherence, band
@@ -99,9 +99,45 @@
  *   - AA 00               Cancel OTA
  *   - AD 01               Confirm page (write buffer to flash)
  *   - AD 00               Reject page (discard, resend)
- * 
+ *
+ *   NARBIS (Path B):
+ *   - C1 00               Forget paired earclip + rescan (BLE central)
+ *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG Path B (replaces v4.14.39 ESP-NOW path):
+ * - Glasses now connect to the Narbis earclip as a BLE central, not via
+ *   Wi-Fi/ESP-NOW. The Bluedroid stack runs in dual-role mode: peripheral
+ *   for the existing phone/dashboard 0xFF01..0xFF04 GATT service, central
+ *   for the earclip's NARBIS_SVC. All Wi-Fi/ESP-NOW code paths and the
+ *   ~28 mA continuous Wi-Fi tax are gone.
+ *
+ *   Pairing: on first boot the central scans for any peripheral whose
+ *   advertisement carries NARBIS_SVC_UUID, picks the highest-RSSI hit,
+ *   persists its MAC to NVS namespace "narbis_pair" key "earclip_mac",
+ *   and connects. Subsequent boots do a directed scan for that MAC.
+ *
+ *   Forget + rescan: two paths.
+ *     - 5 short hall-magnet taps within 2 s (recovery, no app handy).
+ *     - 0xFF01 CTRL opcode 0xC1 NARBIS_FORGET (preferred, via dashboard).
+ *   Both wipe NVS, drop the connection, and start a fresh general scan.
+ *   Visual feedback: 3 fast lens-opacity pulses.
+ *
+ *   On connect: MTU exchange → service discovery → write 0x02 (GLASSES
+ *   peer-role byte) to NARBIS_CHR_PEER_ROLE → subscribe to NARBIS_CHR_IBI
+ *   (and optionally NARBIS_CHR_BATTERY). RAW_PPG is intentionally NOT
+ *   subscribed — power waste for a stream the glasses don't display.
+ *
+ *   v1 dispatch: IBI notifications fall through to on_earclip_ibi() which
+ *   currently only ble_log()s the event. The TODO inside is the integration
+ *   point for fusing the earclip's beats into the on-device coherence IBI
+ *   ring (coh_state).
+ *
+ *   New code lives in components/narbis_ble_central/. The component is
+ *   pulled in via main/CMakeLists.txt's REQUIRES list. Protocol header
+ *   and helpers come from components/narbis_protocol/, a path-add to the
+ *   repo's top-level protocol/ directory (single source of truth).
+ *
  * CHANGELOG v4.14.36:
  * - System health telemetry packet. New 0xF3 binary packet emitted
  *   from ppg_task every 500ms carrying structured health data:
@@ -1475,6 +1511,13 @@
 #include "soc/rtc.h"        /* v4.12.9: rtc_clk_cpu_freq_set_config fallback */
 #include "soc/ledc_struct.h"
 
+/* Path B: Narbis earclip is reached as a BLE central (no Wi-Fi/ESP-NOW).
+ * The central module drives scan/connect/subscribe. Notifications deliver
+ * IBI payloads directly into on_earclip_ibi (defined below). */
+#include <stdbool.h>
+#include "narbis_ble_central.h"
+#include "narbis_protocol.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -1482,8 +1525,8 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.14.38"
-static const char *TAG = "SG_v4.14.38";
+#define FIRMWARE_VERSION "4.14.39"
+static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
  * TEST MODE (v4.14.0) — single-line toggle for bench testing
@@ -3527,6 +3570,15 @@ static void hall_task(void *param) {
     uint32_t high_start_tick = 0;
     bool sleep_fired = false;       /* Prevent double-firing the 5s threshold */
 
+    /* Path B: 5 short taps within a 2-second sliding window forget the
+     * paired earclip and trigger a fresh BLE-central rescan. The taps
+     * also advance 5 programs (existing short-tap behavior) — accepted
+     * side effect; this gesture is the no-app-handy recovery path. */
+    uint8_t  tap_count = 0;
+    uint32_t last_tap_tick = 0;
+    const uint32_t TAP_WINDOW_MS = 2000;
+    const uint8_t  TAP_FORGET_COUNT = 5;
+
     ESP_LOGI(TAG, "Hall gesture task started (poll=%dms short=%d-%dms long=%dms)",
              HALL_POLL_MS, HALL_SHORT_MIN_MS, HALL_SHORT_MAX_MS, HALL_LONG_MS);
 
@@ -3604,6 +3656,24 @@ static void hall_task(void *param) {
                 /* v4.14.34: refresh BLE advertising window on user interaction. */
                 if (ble_stack_up && !is_connected) {
                     ble_adv_reset_deadline();
+                }
+
+                /* Path B: count consecutive short taps for the forget-earclip
+                 * gesture. Taps separated by more than TAP_WINDOW_MS reset
+                 * the counter. */
+                uint32_t gap_ms = (last_tap_tick == 0) ? 0
+                                  : (now - last_tap_tick) * portTICK_PERIOD_MS;
+                if (last_tap_tick != 0 && gap_ms > TAP_WINDOW_MS) tap_count = 0;
+                tap_count++;
+                last_tap_tick = now;
+                if (tap_count >= TAP_FORGET_COUNT) {
+                    ESP_LOGW(TAG, "Hall: 5-tap gesture → forget earclip + rescan");
+                    ble_log("hall 5-tap: narbis forget");
+                    (void)narbis_central_forget();
+                    (void)narbis_central_start();
+                    indicator_trigger(3, 0);   /* 3 fast lens-opacity pulses */
+                    tap_count = 0;
+                    last_tap_tick = 0;
                 }
             } else if (held_ms < HALL_SHORT_MIN_MS) {
                 ESP_LOGI(TAG, "Hall tap %lums < %dms, ignored (noise)",
@@ -3748,7 +3818,38 @@ static void ota_task(void *param) {
 
 /*******************************************************************************
  * COMMAND PROCESSING
+ *
+ * Opcode table (byte 0 of a multi-byte write to 0xFF01 CTRL char):
+ *   0xA2  COMMON: brightness                      (1 arg)
+ *   0xA4  COMMON: session duration minutes        (1 arg)
+ *   0xA5  MODE  : enter STATIC at given duty      (1 arg)
+ *   0xA6  MODE  : enter STROBE                    (0 arg)
+ *   0xA7  COMMON: sleep immediately               (0 arg)
+ *   0xA8  OTA   : start                           (0 arg)
+ *   0xA9  OTA   : finish                          (0 arg)
+ *   0xAA  OTA   : cancel                          (0 arg)
+ *   0xAB  STROBE: frequency Hz                    (1 arg)
+ *   0xAC  STROBE: duty %                          (1 arg)
+ *   0xAD  OTA   : page confirm/reject             (1 arg: 1=ok 0=resend)
+ *   0xB0  MODE  : enter BREATHE                   (0 arg)
+ *   0xB1  BREATH: BPM                             (1 arg)
+ *   0xB2  BREATH: inhale ratio %                  (1 arg)
+ *   0xB3  BREATH: hold-top  (×100ms)              (1 arg)
+ *   0xB4  BREATH: hold-bot  (×100ms)              (1 arg)
+ *   0xB5  BREATH: waveform  (0=sine,1=linear)     (1 arg)
+ *   0xB6  MODE  : PULSE_ON_BEAT                   (0 arg)
+ *   0xB7  PPG   : set program                     (1 arg)
+ *   0xB8  COH   : difficulty 0..3                 (1 arg)
+ *   0xB9  COH   : adaptive pacer 0/1              (1 arg)
+ *   0xBF  PREFS : factory reset                   (0 arg)
+ *   0xC0  DEBUG : ADC scan enable/disable         (1 arg)
+ *   0xC1  NARBIS: forget earclip + rescan         (0 arg) [Path B]
+ *
+ * The legacy single-byte form (len == 1) is treated as static-mode duty
+ * — kept for backwards-compat with the earliest dashboard.
  ******************************************************************************/
+#define CTRL_CMD_NARBIS_FORGET  0xC1
+
 static void process_command(uint8_t *data, uint16_t len) {
     /* Single-byte: legacy duty control → enters static mode */
     if (len == 1) {
@@ -4046,6 +4147,19 @@ static void process_command(uint8_t *data, uint16_t len) {
             }
             break;
 
+        case CTRL_CMD_NARBIS_FORGET:  /* Path B: forget paired earclip,
+                     * trigger a fresh scan/connect cycle. arg ignored.
+                     * Visible feedback: 3 fast lens-opacity pulses. Same
+                     * effect as the 5-tap hall gesture but without the
+                     * program-cycle side effects — preferred path when an
+                     * app is connected. */
+            ESP_LOGW(TAG, "BLE: narbis forget + rescan");
+            ble_log("ctrl 0xC1: narbis forget");
+            (void)narbis_central_forget();
+            (void)narbis_central_start();
+            indicator_trigger(3, 0);
+            break;
+
         case 0xD0:  /* v4.12.6: Manual detector reset.
                      * Clears all detection state (MA buffers, block state,
                      * run counter, last-beat time). Preserves
@@ -4302,11 +4416,16 @@ static void ble_adv_rearm(void) {
  * GAP EVENT HANDLER
  ******************************************************************************/
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    /* Path B: Bluedroid only allows one GAP callback. Forward every event
+     * to the BLE central module so it can drive scan + open. The
+     * peripheral-only events (adv lifecycle) are handled below. */
+    narbis_central_gap_event(event, param);
+
     switch (event) {
         case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
             esp_ble_gap_start_advertising(&adv_params);
             break;
-            
+
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
             if (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
                 ble_adv_active = true;  /* v4.11.0: track state */
@@ -5726,6 +5845,25 @@ static void ppg_task(void *arg) {
 }
 
 /*******************************************************************************
+ * NARBIS EARCLIP — BLE central glue (Path B)
+ *
+ * The narbis_ble_central module handles scan/connect/discover/subscribe
+ * for us. We only see two callbacks: a beat (IBI) and an optional battery
+ * snapshot. v1 just logs; the TODO below is the integration point for the
+ * coherence IBI ring once we want fused beats.
+ ******************************************************************************/
+
+static void on_earclip_ibi(uint16_t ibi_ms, uint8_t conf, uint8_t flags) {
+    ble_log("earclip ibi=%u conf=%u flags=0x%02x", ibi_ms, conf, flags);
+    /* TODO(integrator): push ibi_ms into coh_state IBI ring for fused
+     * dashboard view. Not on Path B's critical path. */
+}
+
+static void on_earclip_battery(uint8_t soc_pct, uint16_t mv, uint8_t charging) {
+    ble_log("earclip batt soc=%u%% mv=%u chg=%u", soc_pct, mv, charging);
+}
+
+/*******************************************************************************
  * MAIN APPLICATION
  ******************************************************************************/
 void app_main(void) {
@@ -5827,6 +5965,20 @@ void app_main(void) {
      * runs at boot and on every hall re-arm after an auto-off teardown. */
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     ESP_ERROR_CHECK(ble_stack_init());
+
+    /* Path B: bring up the BLE central role on top of the existing
+     * peripheral. Bluedroid is dual-role with CONFIG_BT_BLE_DUAL_ROLE=y
+     * (see sdkconfig.defaults). The central registers a separate gattc
+     * app id and shares the GAP callback with the peripheral. */
+    {
+        esp_err_t cerr = narbis_central_init(on_earclip_ibi, on_earclip_battery);
+        if (cerr != ESP_OK) {
+            ESP_LOGW(TAG, "narbis_central_init failed: %s — continuing without earclip RX",
+                     esp_err_to_name(cerr));
+        } else {
+            (void)narbis_central_start();
+        }
+    }
 
     /* v4.11.0: arm the initial BLE idle-off deadline.
      * Advertising itself starts asynchronously (triggered by the GAP
