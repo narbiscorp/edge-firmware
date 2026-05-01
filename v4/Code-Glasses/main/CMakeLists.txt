@@ -4,4 +4,5 @@ idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
     REQUIRES freertos driver nvs_flash bt app_update esp_adc esp_timer
+             narbis_protocol narbis_ble_central
 )
