@@ -2337,8 +2337,6 @@ static void prefs_reset_all(void) {
  * linkage-mismatch errors. Moving the whole function past those
  * definitions is the clean fix. */
 
-/* v4.12.2: forward-declare diagnostic state that's referenced by BLE
- * command handlers (which are defined earlier in the file than the PPG
 /* v4.12.7 forward declaration. ppg_reset_detector is defined with the
  * PPG module later in the file but referenced by process_command (BLE
  * cmd 0xD0 handler). Must be declared before first use. */
@@ -5876,6 +5874,14 @@ static void on_central_state(bool connected) {
     ble_log("relay %s", connected ? "linked" : "lost");
 }
 
+/* Adapter for narbis_central_log_sink_t (non-variadic). The central
+ * pre-formats lines via vsnprintf and hands us a finished string; just
+ * forward it as a literal "%s" to ble_log so it lands in the dashboard's
+ * BLE event log as a 0xF1 frame. */
+static void central_log_sink(const char *msg) {
+    ble_log("%s", msg);
+}
+
 /*******************************************************************************
  * MAIN APPLICATION
  ******************************************************************************/
@@ -5994,7 +6000,7 @@ void app_main(void) {
              * Also bridge the central's own diagnostic log lines into
              * ble_log so scan/connect/subscribe activity shows up in the
              * dashboard's BLE event log without needing a USB monitor. */
-            narbis_central_set_log_sink(ble_log);
+            narbis_central_set_log_sink(central_log_sink);
             narbis_central_set_state_cb(on_central_state);
             narbis_central_set_config_cb(on_earclip_config);
             narbis_central_set_raw_cb(on_earclip_raw);
