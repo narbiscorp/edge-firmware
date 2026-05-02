@@ -75,6 +75,44 @@ void narbis_central_set_log_sink(narbis_central_log_sink_t sink);
 typedef void (*narbis_central_state_cb_t)(bool connected);
 void narbis_central_set_state_cb(narbis_central_state_cb_t cb);
 
+/* CONFIG relay callbacks (Path B Phase 1).
+ *
+ * The earclip exposes two config-related characteristics: NARBIS_CHR_CONFIG
+ * (notify, current runtime config) and NARBIS_CHR_CONFIG_WRITE (write,
+ * accepts a serialized narbis_runtime_config_t). The central subscribes to
+ * CONFIG and performs a one-shot read on connect (the earclip only notifies
+ * CONFIG on changes, never on subscribe) so dashboard sees the initial state.
+ *
+ * Payload to the cb is the wire format: NARBIS_CONFIG_WIRE_SIZE (50 B) of
+ * struct + CRC16. The cb does not need to validate CRC; main.c forwards the
+ * bytes through 0xFF03 type 0xF4 to the dashboard, which deserializes there. */
+typedef void (*narbis_central_config_cb_t)(const uint8_t *bytes, uint16_t len);
+void narbis_central_set_config_cb(narbis_central_config_cb_t cb);
+
+/* RAW_PPG relay callback. Off by default — opt-in via set_raw_enabled().
+ * Payload: u16 sample_rate_hz, u16 n_samples, n × (u32 red, u32 ir).
+ * Up to 4 + 29*8 = 236 B per notify. */
+typedef void (*narbis_central_raw_cb_t)(const uint8_t *bytes, uint16_t len);
+void narbis_central_set_raw_cb(narbis_central_raw_cb_t cb);
+
+/* Toggle whether the central subscribes to the earclip's RAW_PPG char.
+ * - If currently connected and at ST_READY:
+ *     true  → write CCCD = 0x0001 to enable notify
+ *     false → write CCCD = 0x0000 to disable
+ * - Otherwise: latches the desired state and applies on next connect.
+ * Returns ESP_OK on dispatch (or pure latch), ESP_ERR_INVALID_STATE if
+ * the GATTC interface isn't registered yet. */
+esp_err_t narbis_central_set_raw_enabled(bool enabled);
+
+/* Forward a config blob to the earclip via GATTC write to CONFIG_WRITE.
+ * The dashboard sends the same NARBIS_CONFIG_WIRE_SIZE blob it would
+ * write directly; main.c's 0xC3 CTRL handler invokes this with the
+ * payload. Returns ESP_ERR_INVALID_STATE if not connected to earclip
+ * or no CONFIG_WRITE handle was discovered (older earclip firmware).
+ * Async: the GATTC write completion is logged via cb_log; the earclip
+ * will then notify CONFIG which the dashboard picks up as 0xF4. */
+esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
