@@ -870,6 +870,16 @@ void narbis_central_emit_diag(void) {
     cb_log("hdl cfg=%u/%u cfgw=%u raw=%u/%u",
            S.hdl_config, S.hdl_config_cccd, S.hdl_config_write,
            S.hdl_raw, S.hdl_raw_cccd);
+    /* Self-heal: if we have an active conn_id AND IBI/CCCD handles
+     * cached, the state machine got stuck somewhere mid-chain. Force
+     * READY so the dashboard badge updates and downstream consumers
+     * (config writes, raw toggle) start working. The earclip is
+     * already sending notifies — we just need the state to catch up. */
+    if (S.state != ST_READY && S.conn_id != 0 && S.hdl_ibi != 0) {
+        cb_log("self-heal: handles cached + conn_id=%u — forcing READY",
+               S.conn_id);
+        enter_ready();
+    }
 }
 
 esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len) {
