@@ -957,9 +957,10 @@ void narbis_central_emit_diag(void) {
            S.hdl_ibi, S.hdl_ibi_cccd,
            S.hdl_battery, S.hdl_battery_cccd,
            S.hdl_peer_role);
-    cb_log("hdl cfg=%u/%u cfgw=%u raw=%u/%u",
+    cb_log("hdl cfg=%u/%u cfgw=%u raw=%u/%u diag=%u/%u",
            S.hdl_config, S.hdl_config_cccd, S.hdl_config_write,
-           S.hdl_raw, S.hdl_raw_cccd);
+           S.hdl_raw, S.hdl_raw_cccd,
+           S.hdl_diag, S.hdl_diag_cccd);
     /* Notify counters — if state=READY but all of these are 0, the
      * earclip isn't sending OR Bluedroid isn't dispatching. Non-zero
      * means data is actually flowing. */
