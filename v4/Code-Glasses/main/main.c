@@ -5523,13 +5523,18 @@ static void coherence_task(void *arg) {
         ppg_auto_check();
 #endif
 
-        /* Log occasionally so dashboard FW Log tab shows us life + timing */
+        /* Only log coherence when we actually have IBI in the ring;
+         * otherwise (earclip not connected yet) we'd spam "coh=0 n=0"
+         * forever. Once on_earclip_ibi starts pushing beats this fires
+         * every 10 s with real numbers. */
         static uint8_t log_counter = 0;
-        if (++log_counter >= 10) {  /* every 10 sec */
+        if (++log_counter >= 10) {
             log_counter = 0;
-            ble_log("coh=%u resp=%umHz n=%u dt=%ums",
-                    coh_state.coherence, coh_state.resp_peak_mhz,
-                    coh_state.n_ibis_used, dt);
+            if (coh_state.n_ibis_used > 0) {
+                ble_log("coh=%u resp=%umHz n=%u dt=%ums",
+                        coh_state.coherence, coh_state.resp_peak_mhz,
+                        coh_state.n_ibis_used, dt);
+            }
         }
     }
 }
@@ -5742,87 +5747,23 @@ static void ppg_task(void *arg) {
             if (delta_us > 25000) ppg_jitter_ticks_over++;
         }
 
-        uint16_t raw = ppg_read_oversampled();
-        adc_stats_push(raw);
+        /* Internal PPG ripped out — glasses now run earclip-only.
+         * No ADC read, no on-glasses detection, no 0xF0 ADC-stats /
+         * 0xF3 health frame spam, no auto-reset of an unused detector.
+         * The earclip provides IBI via the central relay; lens
+         * pulse-on-beat and coherence are driven from on_earclip_ibi. */
+        (void)sample_idx;
 
-        float filtered = ppg_bandpass((float)raw);
-        bool is_beat = ppg_detect(filtered, now_ms);
-
-        /* v4.12.1: drive LED_MODE_PULSE_ON_BEAT. */
-        if (is_beat) {
-            beat_pulse_start_tick = xTaskGetTickCount();
-            /* v4.13.0: also feed the coherence IBI ring. Only push
-             * beats with a valid IBI (not the very first beat of a
-             * session, which has no predecessor). */
-            if (ppg_current_ibi_ms > 0) {
-                coh_push_ibi(now_ms, (uint16_t)ppg_current_ibi_ms);
-            }
-        }
-
-        ppg_send_sample(raw, sample_idx, now_ms,
-                        is_beat, ppg_in_block,
-                        (uint16_t)ppg_current_ibi_ms, ppg_current_bpm);
-
-        /* ADC stats every 500ms */
-        if (now_ms - last_stats_ms >= 500) {
-            last_stats_ms = now_ms;
-            ppg_emit_adc_stats();
-            ppg_emit_health();   /* v4.14.36: 0xF3 health packet at same cadence */
-        }
-
-
-        /* v4.13.2: periodic detector freshening. Every 30 seconds,
-         * reset the adaptive MA buffers so they can't drift into a
-         * noise-responsive state. Over long noisy sessions the MA_beat
-         * floor can settle at a value that makes every small burst of
-         * ambient energy clear the threshold, producing a flood of
-         * false positives. Hard-resetting once per 30s gives the
-         * adaptive baseline a fresh start.
-         *
-         * Only refresh if not currently in a block (don't interrupt
-         * an in-progress real beat). If the detector is chronically
-         * in_block on noise, we'll still catch it on the next 30s
-         * tick when it happens to be out-of-block.
-         *
-         * Cost: ~1 second of blind detection per 30s window after
-         * warmup re-engages. Acceptable tradeoff for robustness. */
-        if (now_ms - last_auto_reset_ms >= 30000) {
-            last_auto_reset_ms = now_ms;
-            if (!ppg_in_block) {
-                ppg_reset_detector();
-                ble_log("auto-reset detector (30s refresh)");
-            }
-        }
-
-        /* Heartbeat every 5s — basic liveness + PPG state */
+        /* Slim heartbeat every 5 s so the dashboard / FW log can still
+         * see the glasses are alive. Reports CPU clock + uptime + a
+         * single heap number; nothing PPG-related. */
         if (now_ms - last_hb_ms >= 5000) {
             last_hb_ms = now_ms;
-            /* v4.13.3: query actual current CPU frequency via RTC clock config.
-             * Visible here instead of just UART because the boot-time ESP_LOGI
-             * message doesn't reach the BLE FW Log tab (BLE not up yet). */
             rtc_cpu_freq_config_t cur_cpu;
             rtc_clk_cpu_freq_get_config(&cur_cpu);
-            ble_log("ppg t=%us cpu=%uMHz raw=%u gate=%s MAb=%.1f beats=%u jitmax=%uus over=%u",
+            ble_log("alive t=%us cpu=%uMHz heap=%u",
                     now_ms / 1000, (unsigned)cur_cpu.freq_mhz,
-                    (unsigned)raw,
-                    g_sensor_gate_ok ? "ok" : "off",
-                    ppg_beat_sum / (ppg_beat_count ? ppg_beat_count : 1),
-                    (unsigned)ppg_beat_count_total,
-                    (unsigned)ppg_jitter_max_us, (unsigned)ppg_jitter_ticks_over);
-            /* Reset jitter window */
-            ppg_jitter_max_us = 0;
-            ppg_jitter_ticks_over = 0;
-        }
-
-        /* v4.12.2: health report every 10s — heap, stack, BLE errors */
-        if (now_ms - last_health_ms >= 10000) {
-            last_health_ms = now_ms;
-            UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
-            uint32_t heap_free = esp_get_free_heap_size();
-            uint32_t heap_min  = esp_get_minimum_free_heap_size();
-            ble_log("health heap=%u min=%u stack=%u ble_err=%u",
-                    (unsigned)heap_free, (unsigned)heap_min,
-                    (unsigned)hwm, (unsigned)ble_send_errors);
+                    (unsigned)esp_get_free_heap_size());
         }
 
         sample_idx++;
@@ -5841,8 +5782,18 @@ static void ppg_task(void *arg) {
 
 static void on_earclip_ibi(uint16_t ibi_ms, uint8_t conf, uint8_t flags) {
     ble_log("earclip ibi=%u conf=%u flags=0x%02x", ibi_ms, conf, flags);
-    /* TODO(integrator): push ibi_ms into coh_state IBI ring for fused
-     * dashboard view. Not on Path B's critical path. */
+    /* Earclip is now the sole beat source — wire to the same downstream
+     * consumers the old internal ppg_detect used to feed:
+     *   1. LED_MODE_PULSE_ON_BEAT — flash lens once per beat
+     *   2. coh_state IBI ring — drives the coherence/breathing pacer
+     * Skip low-confidence / artifact-flagged beats so noise doesn't
+     * corrupt either path. */
+    if (conf < 50 || (flags & NARBIS_BEAT_FLAG_ARTIFACT)) return;
+    beat_pulse_start_tick = xTaskGetTickCount();
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (ibi_ms > 0) {
+        coh_push_ibi(now_ms, ibi_ms);
+    }
 }
 
 static void on_earclip_battery(uint8_t soc_pct, uint16_t mv, uint8_t charging) {
@@ -5864,14 +5815,24 @@ static void on_earclip_raw(const uint8_t *bytes, uint16_t len) {
 }
 
 /* Path B: glasses-to-earclip relay link state. Fires when the central
- * reaches READY (subscriptions in place) and again on disconnect. The
- * dashboard renders this as a "Earclip relay: linked / searching"
- * badge so users don't have to read the BLE event log to know whether
- * the relay is up. Wire format: pkt[0]=0xF6, pkt[1]=1 connected / 0 not. */
+ * reaches READY (subscriptions in place) and again on disconnect.
+ *
+ * Three side-effects on each transition:
+ *   1. 0xF6 status frame to the dashboard so the header badge updates.
+ *   2. ble_log line so the BLE event log shows the transition.
+ *   3. Visible lens feedback so the user knows without looking at the
+ *      app:  connect → 5 slow pulses + 3 s clear hold (same pattern the
+ *      hall-driven sensor-connected handshake uses);  disconnect → 2
+ *      fast pulses to signal the relay dropped. */
 static void on_central_state(bool connected) {
     uint8_t pkt = connected ? 1u : 0u;
     send_status_frame(0xF6, &pkt, 1);
     ble_log("relay %s", connected ? "linked" : "lost");
+    if (connected) {
+        indicator_trigger(5, 3000);   /* 5 slow pulses + 3 s clear */
+    } else {
+        indicator_trigger(2, 0);      /* 2 fast pulses */
+    }
 }
 
 /* Adapter for narbis_central_log_sink_t (non-variadic). The central
