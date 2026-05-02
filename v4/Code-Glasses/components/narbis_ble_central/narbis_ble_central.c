@@ -718,13 +718,22 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
 
     case ESP_GATTC_READ_CHAR_EVT: {
         const struct gattc_read_char_evt_param *r = &p->read;
-        if (S.state == ST_READING_CONFIG_INITIAL && r->handle == S.hdl_config) {
+        /* Always dispatch CONFIG reads to the callback — could come
+         * from the boot-time chain (state=READING_CONFIG_INITIAL) OR
+         * from enter_ready's idempotent read (state=READY). Without
+         * this the config blob silently drops on the relay path. */
+        if (r->handle == S.hdl_config) {
             if (r->status == ESP_GATT_OK && S.config_cb) {
                 S.config_cb(r->value, r->value_len);
+                cb_log("central: config read ok (%u B)", r->value_len);
             } else if (r->status != ESP_GATT_OK) {
-                cb_log("central: config initial read status=%d", r->status);
+                cb_log("central: config read status=%d", r->status);
             }
-            advance_to_batt_or_raw_or_ready();
+            /* Only advance the state machine if we're actually in the
+             * boot-time chain. In ST_READY this is just a refresh. */
+            if (S.state == ST_READING_CONFIG_INITIAL) {
+                advance_to_batt_or_raw_or_ready();
+            }
         }
         break;
     }
