@@ -95,6 +95,15 @@ void narbis_central_set_config_cb(narbis_central_config_cb_t cb);
 typedef void (*narbis_central_raw_cb_t)(const uint8_t *bytes, uint16_t len);
 void narbis_central_set_raw_cb(narbis_central_raw_cb_t cb);
 
+/* Diagnostics relay callback. Payload is the firmware diagnostic frame:
+ * [seq u16][n u8] then n × (stream_id u8, len u8, payload). The stream
+ * IDs are NARBIS_DIAG_STREAM_* — POST_FILTER drives the dashboard's
+ * Filtered chart. The earclip only emits when its
+ * narbis_runtime_config_t.diagnostics_enabled = 1 AND diagnostics_mask
+ * has the relevant bit set. */
+typedef void (*narbis_central_diag_cb_t)(const uint8_t *bytes, uint16_t len);
+void narbis_central_set_diag_cb(narbis_central_diag_cb_t cb);
+
 /* Toggle whether the central subscribes to the earclip's RAW_PPG char.
  * - If currently connected and at ST_READY:
  *     true  → write CCCD = 0x0001 to enable notify

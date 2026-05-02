@@ -1525,7 +1525,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.0-relay"
+#define FIRMWARE_VERSION "4.15.1-diag"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -5829,6 +5829,15 @@ static void on_earclip_raw(const uint8_t *bytes, uint16_t len) {
     send_status_frame(0xF5, bytes, len);
 }
 
+/* Diagnostics relay — forward earclip diagnostic frames (POST_FILTER
+ * samples, peak candidates, etc.) as 0xF7. The earclip only emits
+ * when its diagnostics_enabled=1 AND diagnostics_mask bits are set,
+ * so this is a no-op when the user hasn't enabled them via the
+ * dashboard's ConfigPanel. */
+static void on_earclip_diag(const uint8_t *bytes, uint16_t len) {
+    send_status_frame(0xF7, bytes, len);
+}
+
 /* Path B: glasses-to-earclip relay link state. Fires when the central
  * reaches READY (subscriptions in place) and again on disconnect.
  *
@@ -5980,6 +5989,7 @@ void app_main(void) {
             narbis_central_set_state_cb(on_central_state);
             narbis_central_set_config_cb(on_earclip_config);
             narbis_central_set_raw_cb(on_earclip_raw);
+            narbis_central_set_diag_cb(on_earclip_diag);
             (void)narbis_central_start();
         }
     }

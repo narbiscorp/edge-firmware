@@ -89,6 +89,7 @@ static struct {
     narbis_central_state_cb_t   state_cb;
     narbis_central_config_cb_t  config_cb;       /* Path B Phase 1 */
     narbis_central_raw_cb_t     raw_cb;          /* Path B Phase 2 */
+    narbis_central_diag_cb_t    diag_cb;         /* diagnostics relay */
     bool                        raw_enabled;     /* user toggle, latched */
     bool                        last_state_emitted;  /* dedup state edges */
 
@@ -109,6 +110,8 @@ static struct {
     uint16_t hdl_config_write;      /* write-only, no CCCD */
     uint16_t hdl_raw;               /* Path B Phase 2: notify */
     uint16_t hdl_raw_cccd;
+    uint16_t hdl_diag;              /* Diagnostics: notify */
+    uint16_t hdl_diag_cccd;
 
     /* Pairing target. */
     uint8_t  earclip_mac[6];
@@ -138,6 +141,7 @@ static struct {
     uint32_t notify_batt_count;
     uint32_t notify_config_count;
     uint32_t notify_raw_count;
+    uint32_t notify_diag_count;
     uint32_t notify_other_count;
 } S;
 
@@ -347,6 +351,7 @@ static void enter_ready(void) {
     if (S.hdl_ibi)     esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_ibi);
     if (S.hdl_battery) esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_battery);
     if (S.hdl_config)  esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_config);
+    if (S.hdl_diag)    esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_diag);
     if (S.raw_enabled && S.hdl_raw) {
         esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_raw);
     }
@@ -356,6 +361,7 @@ static void enter_ready(void) {
     if (S.hdl_ibi_cccd)     cccd_set(S.hdl_ibi_cccd,     true);
     if (S.hdl_config_cccd)  cccd_set(S.hdl_config_cccd,  true);
     if (S.hdl_battery_cccd) cccd_set(S.hdl_battery_cccd, true);
+    if (S.hdl_diag_cccd)    cccd_set(S.hdl_diag_cccd,    true);
     if (S.raw_enabled && S.hdl_raw_cccd) cccd_set(S.hdl_raw_cccd, true);
 
     /* One-shot CONFIG read so dashboard ConfigPanel populates
@@ -427,6 +433,7 @@ static const uint8_t NARBIS_CHR_PEER_ROLE_LE[16]    = NARBIS_CHR_PEER_ROLE_UUID_
 static const uint8_t NARBIS_CHR_CONFIG_LE[16]       = NARBIS_CHR_CONFIG_UUID_BYTES;
 static const uint8_t NARBIS_CHR_CONFIG_WRITE_LE[16] = NARBIS_CHR_CONFIG_WRITE_UUID_BYTES;
 static const uint8_t NARBIS_CHR_RAW_PPG_LE[16]      = NARBIS_CHR_RAW_PPG_UUID_BYTES;
+static const uint8_t NARBIS_CHR_DIAG_LE[16]         = NARBIS_CHR_DIAGNOSTICS_UUID_BYTES;
 
 static bool char_uuid_matches(const esp_bt_uuid_t *u, const uint8_t le16[16]) {
     if (u->len != ESP_UUID_LEN_128) return false;
@@ -461,6 +468,7 @@ static void cache_handles_after_discover(void) {
         else if (char_uuid_matches(&c->uuid, NARBIS_CHR_CONFIG_LE))       S.hdl_config       = c->char_handle;
         else if (char_uuid_matches(&c->uuid, NARBIS_CHR_CONFIG_WRITE_LE)) S.hdl_config_write = c->char_handle;
         else if (char_uuid_matches(&c->uuid, NARBIS_CHR_RAW_PPG_LE))      S.hdl_raw          = c->char_handle;
+        else if (char_uuid_matches(&c->uuid, NARBIS_CHR_DIAG_LE))         S.hdl_diag         = c->char_handle;
     }
     free(chrs);
 
@@ -504,6 +512,16 @@ static void cache_handles_after_discover(void) {
                                                    &d, &dcount) == ESP_GATT_OK
             && dcount > 0) {
             S.hdl_raw_cccd = d.handle;
+        }
+    }
+    if (S.hdl_diag) {
+        uint16_t dcount = 1;
+        esp_gattc_descr_elem_t d;
+        if (esp_ble_gattc_get_descr_by_char_handle(S.gattc_if, S.conn_id,
+                                                   S.hdl_diag, cccd,
+                                                   &d, &dcount) == ESP_GATT_OK
+            && dcount > 0) {
+            S.hdl_diag_cccd = d.handle;
         }
     }
     /* Bridge to cb_log so the dashboard can see which CCCDs were found.
@@ -758,6 +776,9 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         } else if (n->handle == S.hdl_raw && S.raw_cb) {
             S.raw_cb(n->value, n->value_len);
             S.notify_raw_count++;
+        } else if (n->handle == S.hdl_diag && S.diag_cb) {
+            S.diag_cb(n->value, n->value_len);
+            S.notify_diag_count++;
         } else {
             S.notify_other_count++;
         }
@@ -789,8 +810,10 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.hdl_peer_role = 0;
         S.hdl_config = S.hdl_config_cccd = S.hdl_config_write = 0;
         S.hdl_raw = S.hdl_raw_cccd = 0;
+        S.hdl_diag = S.hdl_diag_cccd = 0;
         S.notify_ibi_count = S.notify_config_count = 0;
-        S.notify_batt_count = S.notify_raw_count = S.notify_other_count = 0;
+        S.notify_batt_count = S.notify_raw_count = 0;
+        S.notify_diag_count = S.notify_other_count = 0;
         /* Avoid re-issuing scan if forget()/start() already kicked one
          * off. Without this guard, a forced disconnect during a fresh
          * scan would restart that scan and lose progress. */
@@ -889,6 +912,10 @@ void narbis_central_set_raw_cb(narbis_central_raw_cb_t cb) {
     S.raw_cb = cb;
 }
 
+void narbis_central_set_diag_cb(narbis_central_diag_cb_t cb) {
+    S.diag_cb = cb;
+}
+
 esp_err_t narbis_central_set_raw_enabled(bool enabled) {
     S.raw_enabled = enabled;
     /* Latch only if not in a state where we can write the CCCD now. */
@@ -936,10 +963,10 @@ void narbis_central_emit_diag(void) {
     /* Notify counters — if state=READY but all of these are 0, the
      * earclip isn't sending OR Bluedroid isn't dispatching. Non-zero
      * means data is actually flowing. */
-    cb_log("rx ibi=%u cfg=%u batt=%u raw=%u other=%u",
+    cb_log("rx ibi=%u cfg=%u batt=%u raw=%u diag=%u other=%u",
            (unsigned)S.notify_ibi_count, (unsigned)S.notify_config_count,
            (unsigned)S.notify_batt_count, (unsigned)S.notify_raw_count,
-           (unsigned)S.notify_other_count);
+           (unsigned)S.notify_diag_count, (unsigned)S.notify_other_count);
     /* Self-heal: if we have an active conn_id AND IBI/CCCD handles
      * cached, the state machine got stuck somewhere mid-chain. Force
      * READY (which now also re-issues register_for_notify + CCCD
