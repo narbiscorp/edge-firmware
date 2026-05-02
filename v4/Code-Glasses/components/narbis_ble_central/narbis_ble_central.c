@@ -129,6 +129,16 @@ static struct {
      * at all, and whether any match the NARBIS service UUID. */
     uint16_t scan_advs_seen;
     uint16_t scan_advs_matched;
+
+    /* Per-char notify counters — printed in diag so we can see which
+     * subscriptions are actually receiving data from the earclip. If
+     * state=READY but all counters stay 0, the earclip isn't sending
+     * (no finger on sensor) OR Bluedroid isn't dispatching to us. */
+    uint32_t notify_ibi_count;
+    uint32_t notify_batt_count;
+    uint32_t notify_config_count;
+    uint32_t notify_raw_count;
+    uint32_t notify_other_count;
 } S;
 
 /* ---- log sink + state callback helpers ------------------------------- */
@@ -318,9 +328,45 @@ static esp_err_t cccd_set(uint16_t cccd_handle, bool enable) {
 static void advance_to_raw_or_ready(void);
 
 /* Transition to ST_READY and emit a log line listing whatever the earclip
- * actually exposed (older earclip firmware may lack config/battery/raw). */
+ * actually exposed (older earclip firmware may lack config/battery/raw).
+ *
+ * Idempotent: re-issues `register_for_notify` + CCCD writes for every
+ * cached notify handle so this works correctly whether called via the
+ * normal subscribe chain (where these are no-ops since the chain
+ * already did them) OR via the self-heal path (where the chain stalled
+ * mid-way and these are essential to actually start receiving data).
+ *
+ * Also issues a one-shot CONFIG read so the dashboard's ConfigPanel
+ * populates immediately on relay-up. */
 static void enter_ready(void) {
     S.state = ST_READY;
+
+    /* Bluedroid requires register_for_notify to dispatch incoming
+     * notifies to gattc_cb. Without it, even a CCCD-enabled peer's
+     * notifies are filtered out at the host layer. */
+    if (S.hdl_ibi)     esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_ibi);
+    if (S.hdl_battery) esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_battery);
+    if (S.hdl_config)  esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_config);
+    if (S.raw_enabled && S.hdl_raw) {
+        esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_raw);
+    }
+
+    /* Write 0x0001 to each CCCD to ask the earclip to send notifies.
+     * Idempotent — the peer just acks if already subscribed. */
+    if (S.hdl_ibi_cccd)     cccd_set(S.hdl_ibi_cccd,     true);
+    if (S.hdl_config_cccd)  cccd_set(S.hdl_config_cccd,  true);
+    if (S.hdl_battery_cccd) cccd_set(S.hdl_battery_cccd, true);
+    if (S.raw_enabled && S.hdl_raw_cccd) cccd_set(S.hdl_raw_cccd, true);
+
+    /* One-shot CONFIG read so dashboard ConfigPanel populates
+     * immediately. The earclip only notifies CONFIG on changes, so
+     * without this initial read the panel would stay empty until the
+     * user makes the first edit. */
+    if (S.hdl_config) {
+        esp_ble_gattc_read_char(S.gattc_if, S.conn_id, S.hdl_config,
+                                ESP_GATT_AUTH_REQ_NONE);
+    }
+
     cb_log("central: ready (IBI%s%s%s subscribed)",
            S.hdl_config_cccd  ? " + config"  : "",
            S.hdl_battery_cccd ? " + battery" : "",
@@ -690,15 +736,21 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
             narbis_ibi_payload_t pl;
             memcpy(&pl, n->value, sizeof(pl));
             if (S.ibi_cb) S.ibi_cb(pl.ibi_ms, pl.confidence_x100, pl.flags);
+            S.notify_ibi_count++;
         } else if (n->handle == S.hdl_battery
                    && n->value_len >= sizeof(narbis_battery_payload_t)) {
             narbis_battery_payload_t pl;
             memcpy(&pl, n->value, sizeof(pl));
             if (S.batt_cb) S.batt_cb(pl.soc_pct, pl.mv, pl.charging);
+            S.notify_batt_count++;
         } else if (n->handle == S.hdl_config && S.config_cb) {
             S.config_cb(n->value, n->value_len);
+            S.notify_config_count++;
         } else if (n->handle == S.hdl_raw && S.raw_cb) {
             S.raw_cb(n->value, n->value_len);
+            S.notify_raw_count++;
+        } else {
+            S.notify_other_count++;
         }
         S.last_seen_us = esp_timer_get_time();
         /* Self-heal: if we're already receiving notifies but the state
@@ -728,6 +780,8 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.hdl_peer_role = 0;
         S.hdl_config = S.hdl_config_cccd = S.hdl_config_write = 0;
         S.hdl_raw = S.hdl_raw_cccd = 0;
+        S.notify_ibi_count = S.notify_config_count = 0;
+        S.notify_batt_count = S.notify_raw_count = S.notify_other_count = 0;
         /* Avoid re-issuing scan if forget()/start() already kicked one
          * off. Without this guard, a forced disconnect during a fresh
          * scan would restart that scan and lose progress. */
@@ -870,11 +924,18 @@ void narbis_central_emit_diag(void) {
     cb_log("hdl cfg=%u/%u cfgw=%u raw=%u/%u",
            S.hdl_config, S.hdl_config_cccd, S.hdl_config_write,
            S.hdl_raw, S.hdl_raw_cccd);
+    /* Notify counters — if state=READY but all of these are 0, the
+     * earclip isn't sending OR Bluedroid isn't dispatching. Non-zero
+     * means data is actually flowing. */
+    cb_log("rx ibi=%u cfg=%u batt=%u raw=%u other=%u",
+           (unsigned)S.notify_ibi_count, (unsigned)S.notify_config_count,
+           (unsigned)S.notify_batt_count, (unsigned)S.notify_raw_count,
+           (unsigned)S.notify_other_count);
     /* Self-heal: if we have an active conn_id AND IBI/CCCD handles
      * cached, the state machine got stuck somewhere mid-chain. Force
-     * READY so the dashboard badge updates and downstream consumers
-     * (config writes, raw toggle) start working. The earclip is
-     * already sending notifies — we just need the state to catch up. */
+     * READY (which now also re-issues register_for_notify + CCCD
+     * writes + initial CONFIG read, idempotent), so downstream data
+     * actually starts flowing. */
     if (S.state != ST_READY && S.conn_id != 0 && S.hdl_ibi != 0) {
         cb_log("self-heal: handles cached + conn_id=%u — forcing READY",
                S.conn_id);
