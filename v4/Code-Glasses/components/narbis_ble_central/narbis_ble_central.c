@@ -239,6 +239,9 @@ static esp_ble_scan_params_t scan_params = {
 };
 
 static void start_scan_directed(void) {
+    /* Cancel any pending backoff so we don't double-fire a scan when
+     * the timer expires after we're already scanning. */
+    if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
     S.state = ST_SCANNING_DIRECTED;
     S.scan_attempts++;
     int64_t now = esp_timer_get_time();
@@ -251,6 +254,7 @@ static void start_scan_directed(void) {
 }
 
 static void start_scan_general(void) {
+    if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
     S.state = ST_SCANNING_GENERAL;
     S.scan_attempts++;
     memset(&S.best, 0, sizeof(S.best));
@@ -583,6 +587,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         break;
 
     case ESP_GATTC_CONNECT_EVT:
+        if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
         S.conn_id = p->connect.conn_id;
         S.last_seen_us = esp_timer_get_time();
         S.state = ST_DISCOVERING;
@@ -595,7 +600,21 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     case ESP_GATTC_OPEN_EVT:
         if (p->open.status != ESP_GATT_OK) {
             cb_log("central: open failed status=%d", p->open.status);
-            schedule_reconnect_backoff();
+            /* Status 0x91 ESP_GATT_ALREADY_OPEN = Bluedroid still
+             * tracks a previous connection (or pending open) to this
+             * MAC. Backing off and retrying loops forever — the stale
+             * state needs a force-disconnect to clear. The DISCONNECT
+             * event will then fire and auto-restart the scan; we add
+             * a short backoff as a safety net in case it doesn't. */
+            if (p->open.status == ESP_GATT_ALREADY_OPEN) {
+                cb_log("central: stale conn — forcing gap_disconnect");
+                (void)esp_ble_gap_disconnect(S.earclip_mac);
+                S.state = ST_BACKOFF;
+                if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
+                esp_timer_start_once(S.backoff_timer, 2 * 1000 * 1000ULL);
+            } else {
+                schedule_reconnect_backoff();
+            }
         }
         break;
 
@@ -695,8 +714,13 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.hdl_peer_role = 0;
         S.hdl_config = S.hdl_config_cccd = S.hdl_config_write = 0;
         S.hdl_raw = S.hdl_raw_cccd = 0;
-        if (S.earclip_known) start_scan_directed();
-        else                 start_scan_general();
+        /* Avoid re-issuing scan if forget()/start() already kicked one
+         * off. Without this guard, a forced disconnect during a fresh
+         * scan would restart that scan and lose progress. */
+        if (S.state != ST_SCANNING_DIRECTED && S.state != ST_SCANNING_GENERAL) {
+            if (S.earclip_known) start_scan_directed();
+            else                 start_scan_general();
+        }
         break;
 
     default:
@@ -750,7 +774,15 @@ esp_err_t narbis_central_forget(void) {
     ESP_LOGW(TAG, "central: forget paired earclip");
     if (S.conn_id) {
         esp_ble_gattc_close(S.gattc_if, S.conn_id);
-    } else if (S.state == ST_SCANNING_DIRECTED || S.state == ST_SCANNING_GENERAL) {
+    }
+    /* Defensive: even if our tracked conn_id is 0, Bluedroid may still
+     * have a stale connection to the previous MAC (e.g. earclip
+     * power-cycled mid-session). Force-disconnect on the stored MAC
+     * before wiping it so the next open() doesn't return ALREADY_OPEN. */
+    if (S.earclip_known) {
+        (void)esp_ble_gap_disconnect(S.earclip_mac);
+    }
+    if (S.state == ST_SCANNING_DIRECTED || S.state == ST_SCANNING_GENERAL) {
         esp_ble_gap_stop_scanning();
     }
     if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
