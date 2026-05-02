@@ -113,6 +113,12 @@ esp_err_t narbis_central_set_raw_enabled(bool enabled);
  * will then notify CONFIG which the dashboard picks up as 0xF4. */
 esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len);
 
+/* Re-emit the post-discovery handles diagnostic + current state via
+ * cb_log. Used when a fresh dashboard connects after the central has
+ * already reached READY — without this, the dashboard would never see
+ * the discovery / ready logs that fired into the void at boot. */
+void narbis_central_emit_diag(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -736,6 +736,12 @@ esp_err_t narbis_central_init(narbis_central_ibi_cb_t     ibi_cb,
     S.ibi_cb  = ibi_cb;
     S.batt_cb = batt_cb;
     S.gattc_if = ESP_GATT_IF_NONE;
+    /* Default raw-PPG relay ON so the central subscribes during the
+     * boot-time connect chain (rather than waiting for the dashboard's
+     * 0xC4=1 to arrive after READY — by then the chain has finished
+     * and the toggle would only apply on next reconnect). The dashboard
+     * can still turn it off mid-session via 0xC4=0. */
+    S.raw_enabled = true;
 
     esp_err_t err;
     /* GAP callback is owned by main.c's gap_event_handler — it forwards
@@ -817,6 +823,23 @@ esp_err_t narbis_central_set_raw_enabled(bool enabled) {
     esp_err_t err = cccd_set(S.hdl_raw_cccd, enabled);
     cb_log("central: raw subscribe %s rc=%d", enabled ? "on" : "off", err);
     return err;
+}
+
+void narbis_central_emit_diag(void) {
+    cb_log("relay state=%s ready=%d",
+           S.state == ST_READY ? "READY" :
+           S.state == ST_BACKOFF ? "BACKOFF" :
+           S.state == ST_SCANNING_DIRECTED ? "SCAN_DIR" :
+           S.state == ST_SCANNING_GENERAL ? "SCAN_GEN" :
+           S.state == ST_CONNECTING ? "CONNECTING" :
+           S.state == ST_DISCOVERING ? "DISCOVER" : "OTHER",
+           narbis_central_is_connected() ? 1 : 0);
+    cb_log("handles ibi=%u/%u batt=%u/%u role=%u cfg=%u/%u cfgw=%u raw=%u/%u",
+           S.hdl_ibi, S.hdl_ibi_cccd,
+           S.hdl_battery, S.hdl_battery_cccd,
+           S.hdl_peer_role,
+           S.hdl_config, S.hdl_config_cccd, S.hdl_config_write,
+           S.hdl_raw, S.hdl_raw_cccd);
 }
 
 esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len) {

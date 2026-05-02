@@ -4697,6 +4697,16 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
                     if (notifications_enabled) {
                         ble_log("Narbis fw v%s test=%d mode=%d",
                                 FIRMWARE_VERSION, PPG_TEST_BUILD, (int)led_mode);
+                        /* Refresh fresh dashboard with current relay state.
+                         * The 0xF6 + handles diagnostic that fired during
+                         * boot went into the void (no client). Do it now
+                         * so the header badge + log catch up. */
+                        bool relay_up = narbis_central_is_connected();
+                        uint8_t pkt = relay_up ? 1u : 0u;
+                        send_status_frame(0xF6, &pkt, 1);
+                        ble_log("relay %s (refresh on dashboard connect)",
+                                relay_up ? "linked" : "lost");
+                        narbis_central_emit_diag();
                     }
                 }
             }
