@@ -5889,6 +5889,12 @@ static void central_state_cb(bool connected) {
         ble_log("earclip up: prog 1 + ADC off");
         ppg_apply_program(PPG_PROG_HEARTBEAT);
         adc_scan_enabled = false;
+        /* Visual confirmation: 5 slow lens pulses = "sensor connected"
+         * handshake (matches v4.14.2 ADC-connected pattern). Fires on
+         * every successful pair AND on every auto-reconnect after the
+         * earclip wakes from deep sleep, so the wearer can tell at a
+         * glance that the link came back. */
+        indicator_trigger(5, 3000);
     } else {
         /* Earclip dropped. Restore the program + ADC mode that was
          * active before the connect. Avoids leaving the glasses in a
