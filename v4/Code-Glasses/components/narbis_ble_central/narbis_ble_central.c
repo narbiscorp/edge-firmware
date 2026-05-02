@@ -701,6 +701,20 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
             S.raw_cb(n->value, n->value_len);
         }
         S.last_seen_us = esp_timer_get_time();
+        /* Self-heal: if we're already receiving notifies but the state
+         * machine never advanced to READY (e.g. WRITE_DESCR_EVT for the
+         * last subscribe was lost under load), the subscribe chain
+         * obviously succeeded — force the transition so emit_state(true)
+         * fires and the dashboard badge updates. */
+        if (S.state != ST_READY &&
+            (S.state == ST_SUBSCRIBING_IBI ||
+             S.state == ST_SUBSCRIBING_CONFIG ||
+             S.state == ST_READING_CONFIG_INITIAL ||
+             S.state == ST_SUBSCRIBING_BATT ||
+             S.state == ST_SUBSCRIBING_RAW)) {
+            cb_log("central: notify mid-subscribe (st=%d) — force READY", (int)S.state);
+            enter_ready();
+        }
         break;
     }
 
