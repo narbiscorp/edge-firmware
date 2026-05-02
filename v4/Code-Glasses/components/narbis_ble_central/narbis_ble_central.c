@@ -803,6 +803,16 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     case ESP_GATTC_DISCONNECT_EVT:
         cb_log("central: disconnected reason=%d", p->disconnect.reason);
         emit_state(false);
+        /* Unregister all per-char notify registrations so they don't
+         * pile up in Bluedroid's internal table (default cap of 5
+         * entries via CONFIG_BT_GATTC_NOTIF_REG_MAX). Without this,
+         * after a few reconnects the table fills, new register_for_notify
+         * calls fail, and downstream discovery/notify dispatch breaks. */
+        if (S.hdl_ibi)     esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_ibi);
+        if (S.hdl_battery) esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_battery);
+        if (S.hdl_config)  esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_config);
+        if (S.hdl_raw)     esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_raw);
+        if (S.hdl_diag)    esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_diag);
         S.conn_id = 0;
         S.svc_start_handle = S.svc_end_handle = 0;
         S.hdl_ibi = S.hdl_ibi_cccd = 0;
