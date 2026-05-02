@@ -112,6 +112,12 @@ static struct {
 
     /* esp_timer for the 30 s reconnect backoff. */
     esp_timer_handle_t backoff_timer;
+
+    /* Scan diagnostics — counted during each scan window, logged at
+     * SCAN_INQ_CMPL_EVT. Tells us whether the central is seeing adverts
+     * at all, and whether any match the NARBIS service UUID. */
+    uint16_t scan_advs_seen;
+    uint16_t scan_advs_matched;
 } S;
 
 /* ---- log sink + state callback helpers ------------------------------- */
@@ -373,25 +379,34 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
         if (r->search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) {
             if (r->search_evt == ESP_GAP_SEARCH_INQ_CMPL_EVT) {
                 /* Scan window elapsed. */
-                if (S.state == ST_SCANNING_GENERAL && S.best.valid) {
-                    memcpy(S.earclip_mac, S.best.bda, 6);
-                    S.earclip_known = true;
-                    (void)nvs_write_earclip(S.earclip_mac);
-                    ESP_LOGI(TAG, "best earclip rssi=%d, persisted", S.best.rssi);
-                    S.state = ST_CONNECTING;
-                    esp_ble_gattc_open(S.gattc_if, S.earclip_mac, BLE_ADDR_TYPE_PUBLIC, true);
+                if (S.state == ST_SCANNING_GENERAL) {
+                    cb_log("central: scan done, %u adv seen, %u matched narbis",
+                           (unsigned)S.scan_advs_seen,
+                           (unsigned)S.scan_advs_matched);
+                    if (S.best.valid) {
+                        memcpy(S.earclip_mac, S.best.bda, 6);
+                        S.earclip_known = true;
+                        (void)nvs_write_earclip(S.earclip_mac);
+                        cb_log("central: best rssi=%d, persisted", S.best.rssi);
+                        S.state = ST_CONNECTING;
+                        esp_ble_gattc_open(S.gattc_if, S.earclip_mac, BLE_ADDR_TYPE_PUBLIC, true);
+                    } else {
+                        schedule_reconnect_backoff();
+                    }
                 } else if (S.state == ST_SCANNING_DIRECTED) {
-                    /* Saw nothing in the directed window — back off. */
-                    schedule_reconnect_backoff();
-                } else if (S.state == ST_SCANNING_GENERAL) {
-                    /* Empty general scan — back off, retry general. */
+                    cb_log("central: directed scan done, %u adv seen, target not found",
+                           (unsigned)S.scan_advs_seen);
                     schedule_reconnect_backoff();
                 }
+                S.scan_advs_seen = 0;
+                S.scan_advs_matched = 0;
             }
             break;
         }
 
-        /* Inquiry result hit. */
+        /* Inquiry result hit — count it for diagnostics. */
+        S.scan_advs_seen++;
+
         if (S.state == ST_SCANNING_DIRECTED) {
             if (S.earclip_known
                 && memcmp(r->bda, S.earclip_mac, 6) == 0) {
@@ -402,6 +417,14 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
             }
         } else if (S.state == ST_SCANNING_GENERAL) {
             if (adv_contains_narbis_svc(r->ble_adv, r->adv_data_len + r->scan_rsp_len)) {
+                S.scan_advs_matched++;
+                /* Log the first match per scan window so users can see
+                 * proof-of-life without spamming with every adv. */
+                if (S.scan_advs_matched == 1) {
+                    cb_log("central: matched narbis adv %02x:%02x:%02x:%02x:%02x:%02x rssi=%d",
+                           r->bda[0], r->bda[1], r->bda[2],
+                           r->bda[3], r->bda[4], r->bda[5], r->rssi);
+                }
                 if (!S.best.valid || r->rssi > S.best.rssi) {
                     S.best.valid = true;
                     S.best.rssi = r->rssi;
