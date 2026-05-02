@@ -5863,6 +5863,46 @@ static void on_earclip_battery(uint8_t soc_pct, uint16_t mv, uint8_t charging) {
     ble_log("earclip batt soc=%u%% mv=%u chg=%u", soc_pct, mv, charging);
 }
 
+/* Adapter for narbis_central's log sink: takes a fixed string, our
+ * ble_log takes printf format. Just pass the message as a single %s. */
+static void central_log_sink(const char *msg) {
+    if (msg) ble_log("%s", msg);
+}
+
+/* State snapshot for restoring on disconnect. */
+static ppg_program_t pre_earclip_program;
+static bool          pre_earclip_adc_scan;
+static bool          pre_earclip_state_saved = false;
+
+static void central_state_cb(bool connected) {
+    if (connected) {
+        /* Earclip is now providing IBI over BLE. Switch to Program 1
+         * (PULSE_ON_BEAT / heartbeat) which expects external beats and
+         * disable the on-glasses ADC scan so the internal PulseSensor
+         * pin stops sampling. Snapshot prior state so disconnect can
+         * restore. */
+        if (!pre_earclip_state_saved) {
+            pre_earclip_program     = ppg_current_program;
+            pre_earclip_adc_scan    = adc_scan_enabled;
+            pre_earclip_state_saved = true;
+        }
+        ble_log("earclip up: prog 1 + ADC off");
+        ppg_apply_program(PPG_PROG_HEARTBEAT);
+        adc_scan_enabled = false;
+    } else {
+        /* Earclip dropped. Restore the program + ADC mode that was
+         * active before the connect. Avoids leaving the glasses in a
+         * silent "expecting external beats but none arriving" state. */
+        if (pre_earclip_state_saved) {
+            ble_log("earclip down: restore prog %d, ADC=%d",
+                    (int)pre_earclip_program, (int)pre_earclip_adc_scan);
+            ppg_apply_program(pre_earclip_program);
+            adc_scan_enabled = pre_earclip_adc_scan;
+            pre_earclip_state_saved = false;
+        }
+    }
+}
+
 /*******************************************************************************
  * MAIN APPLICATION
  ******************************************************************************/
@@ -5976,6 +6016,14 @@ void app_main(void) {
             ESP_LOGW(TAG, "narbis_central_init failed: %s — continuing without earclip RX",
                      esp_err_to_name(cerr));
         } else {
+            /* Bridge central's pairing-flow logs into 0xF1 frames so the
+             * dashboard's BLE event log shows scan/connect/subscribe
+             * lines (otherwise they only appear on the UART monitor). */
+            narbis_central_set_log_sink(central_log_sink);
+            /* Fire central_state_cb on READY/disconnect — we use it to
+             * switch the on-glasses program to Program 1 and turn off
+             * the internal ADC pin while the earclip is providing IBI. */
+            narbis_central_set_state_cb(central_state_cb);
             (void)narbis_central_start();
         }
     }

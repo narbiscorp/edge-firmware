@@ -25,6 +25,8 @@
 
 #include "narbis_ble_central.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_bt.h"
@@ -80,6 +82,9 @@ static struct {
 
     narbis_central_ibi_cb_t     ibi_cb;
     narbis_central_battery_cb_t batt_cb;
+    narbis_central_log_sink_t   log_sink;
+    narbis_central_state_cb_t   state_cb;
+    bool                        last_state_emitted;  /* dedup state edges */
 
     /* Bluedroid handles. */
     esp_gatt_if_t gattc_if;
@@ -108,6 +113,38 @@ static struct {
     /* esp_timer for the 30 s reconnect backoff. */
     esp_timer_handle_t backoff_timer;
 } S;
+
+/* ---- log sink + state callback helpers ------------------------------- */
+
+/* Mirror an ESP_LOG-style line to both ESP_LOG (UART) and the registered
+ * sink (typically main.c's ble_log → 0xFF03 frame type 0xF1). The sink
+ * sees the message without a newline; main.c's ble_log adds the framing. */
+static void cb_log(const char *fmt, ...) {
+    char buf[96];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n >= sizeof(buf)) n = sizeof(buf) - 1;
+    buf[n] = '\0';
+    ESP_LOGI(TAG, "%s", buf);
+    if (S.log_sink) S.log_sink(buf);
+}
+
+static void emit_state(bool connected) {
+    if (S.last_state_emitted == connected) return;
+    S.last_state_emitted = connected;
+    if (S.state_cb) S.state_cb(connected);
+}
+
+void narbis_central_set_log_sink(narbis_central_log_sink_t sink) {
+    S.log_sink = sink;
+}
+
+void narbis_central_set_state_cb(narbis_central_state_cb_t cb) {
+    S.state_cb = cb;
+}
 
 /* ---- NVS helpers ----------------------------------------------------- */
 
@@ -190,8 +227,8 @@ static void start_scan_directed(void) {
     int64_t now = esp_timer_get_time();
     int last_seen_s = (S.last_seen_us == 0) ? -1
                      : (int)((now - S.last_seen_us) / 1000000);
-    ESP_LOGI(TAG, "central: scanning attempt %lu, last seen %d s ago (directed)",
-             (unsigned long)S.scan_attempts, last_seen_s);
+    cb_log("central: scanning attempt %lu, last seen %d s ago (directed)",
+           (unsigned long)S.scan_attempts, last_seen_s);
     esp_ble_gap_set_scan_params(&scan_params);
     esp_ble_gap_start_scanning(SCAN_DIRECTED_S);
 }
@@ -203,15 +240,15 @@ static void start_scan_general(void) {
     int64_t now = esp_timer_get_time();
     int last_seen_s = (S.last_seen_us == 0) ? -1
                      : (int)((now - S.last_seen_us) / 1000000);
-    ESP_LOGI(TAG, "central: scanning attempt %lu, last seen %d s ago (general)",
-             (unsigned long)S.scan_attempts, last_seen_s);
+    cb_log("central: scanning attempt %lu, last seen %d s ago (general)",
+           (unsigned long)S.scan_attempts, last_seen_s);
     esp_ble_gap_set_scan_params(&scan_params);
     esp_ble_gap_start_scanning(SCAN_GENERAL_S);
 }
 
 static void schedule_reconnect_backoff(void) {
     S.state = ST_BACKOFF;
-    ESP_LOGW(TAG, "central: backoff %d ms before next scan", RECONNECT_BACKOFF_MS);
+    cb_log("central: backoff %d ms before next scan", RECONNECT_BACKOFF_MS);
     esp_timer_start_once(S.backoff_timer, (uint64_t)RECONNECT_BACKOFF_MS * 1000ULL);
 }
 
@@ -401,7 +438,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.conn_id = p->connect.conn_id;
         S.last_seen_us = esp_timer_get_time();
         S.state = ST_DISCOVERING;
-        ESP_LOGI(TAG, "central: connected, conn_id=%u", S.conn_id);
+        cb_log("central: connected, conn_id=%u", S.conn_id);
         /* Negotiate larger MTU; safe default 200, falls back to 23 on
          * peripherals that decline. */
         esp_ble_gattc_send_mtu_req(gattc_if, S.conn_id);
@@ -456,11 +493,13 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                 cccd_subscribe(S.hdl_battery_cccd);
             } else {
                 S.state = ST_READY;
-                ESP_LOGI(TAG, "central: ready (IBI subscribed, no battery)");
+                cb_log("central: ready (IBI subscribed, no battery)");
+                emit_state(true);
             }
         } else if (S.state == ST_SUBSCRIBING_BATT) {
             S.state = ST_READY;
-            ESP_LOGI(TAG, "central: ready (IBI + battery subscribed)");
+            cb_log("central: ready (IBI + battery subscribed)");
+            emit_state(true);
         }
         break;
 
@@ -482,7 +521,8 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     }
 
     case ESP_GATTC_DISCONNECT_EVT:
-        ESP_LOGW(TAG, "central: disconnected reason=%d", p->disconnect.reason);
+        cb_log("central: disconnected reason=%d", p->disconnect.reason);
+        emit_state(false);
         S.conn_id = 0;
         S.svc_start_handle = S.svc_end_handle = 0;
         S.hdl_ibi = S.hdl_ibi_cccd = 0;
