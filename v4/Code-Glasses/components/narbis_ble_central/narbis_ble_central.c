@@ -825,19 +825,35 @@ esp_err_t narbis_central_set_raw_enabled(bool enabled) {
     return err;
 }
 
+static const char *state_name(central_state_t s) {
+    switch (s) {
+    case ST_IDLE:                   return "IDLE";
+    case ST_SCANNING_DIRECTED:      return "SCAN_DIR";
+    case ST_SCANNING_GENERAL:       return "SCAN_GEN";
+    case ST_CONNECTING:             return "CONNECTING";
+    case ST_DISCOVERING:            return "DISCOVER";
+    case ST_WRITING_ROLE:           return "WRITE_ROLE";
+    case ST_SUBSCRIBING_IBI:        return "SUB_IBI";
+    case ST_SUBSCRIBING_CONFIG:     return "SUB_CFG";
+    case ST_READING_CONFIG_INITIAL: return "READ_CFG";
+    case ST_SUBSCRIBING_BATT:       return "SUB_BATT";
+    case ST_SUBSCRIBING_RAW:        return "SUB_RAW";
+    case ST_READY:                  return "READY";
+    case ST_BACKOFF:                return "BACKOFF";
+    }
+    return "?";
+}
+
 void narbis_central_emit_diag(void) {
-    cb_log("relay state=%s ready=%d",
-           S.state == ST_READY ? "READY" :
-           S.state == ST_BACKOFF ? "BACKOFF" :
-           S.state == ST_SCANNING_DIRECTED ? "SCAN_DIR" :
-           S.state == ST_SCANNING_GENERAL ? "SCAN_GEN" :
-           S.state == ST_CONNECTING ? "CONNECTING" :
-           S.state == ST_DISCOVERING ? "DISCOVER" : "OTHER",
+    cb_log("relay state=%s ready=%d", state_name(S.state),
            narbis_central_is_connected() ? 1 : 0);
-    cb_log("handles ibi=%u/%u batt=%u/%u role=%u cfg=%u/%u cfgw=%u raw=%u/%u",
+    /* Split handles across two lines so neither overruns the 64-byte
+     * ble_log buffer (which truncates the trailing CCCD value). */
+    cb_log("hdl ibi=%u/%u batt=%u/%u role=%u",
            S.hdl_ibi, S.hdl_ibi_cccd,
            S.hdl_battery, S.hdl_battery_cccd,
-           S.hdl_peer_role,
+           S.hdl_peer_role);
+    cb_log("hdl cfg=%u/%u cfgw=%u raw=%u/%u",
            S.hdl_config, S.hdl_config_cccd, S.hdl_config_write,
            S.hdl_raw, S.hdl_raw_cccd);
 }

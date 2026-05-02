@@ -5764,16 +5764,21 @@ static void ppg_task(void *arg) {
          * pulse-on-beat and coherence are driven from on_earclip_ibi. */
         (void)sample_idx;
 
-        /* Slim heartbeat every 5 s so the dashboard / FW log can still
-         * see the glasses are alive. Reports CPU clock + uptime + a
-         * single heap number; nothing PPG-related. */
-        if (now_ms - last_hb_ms >= 5000) {
+        /* Slim heartbeat every 30 s — also re-broadcast the relay
+         * state via 0xF6 + diag so the dashboard's badge stays in sync
+         * even if it missed the on-connect refresh (e.g., reconnected
+         * after the visible-log window scrolled past it). */
+        if (now_ms - last_hb_ms >= 30000) {
             last_hb_ms = now_ms;
             rtc_cpu_freq_config_t cur_cpu;
             rtc_clk_cpu_freq_get_config(&cur_cpu);
             ble_log("alive t=%us cpu=%uMHz heap=%u",
                     now_ms / 1000, (unsigned)cur_cpu.freq_mhz,
                     (unsigned)esp_get_free_heap_size());
+            bool relay_up = narbis_central_is_connected();
+            uint8_t pkt = relay_up ? 1u : 0u;
+            send_status_frame(0xF6, &pkt, 1);
+            narbis_central_emit_diag();
         }
 
         sample_idx++;
