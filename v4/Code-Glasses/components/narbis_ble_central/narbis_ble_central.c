@@ -778,17 +778,30 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         }
         break;
 
-    case ESP_GATTC_CONNECT_EVT:
+    case ESP_GATTC_CONNECT_EVT: {
+        /* Capture the previous state for diagnostics. With SMP enabled in
+         * sdkconfig (CONFIG_BT_BLE_SMP_ENABLE=y, CONFIG_BT_BLE_SMP_BOND_NVS_FLASH=y),
+         * Bluedroid can produce CONNECT_EVT from a bonded-peer auto-reconnect
+         * without us ever calling gattc_open() — our state would still be
+         * ST_SCANNING_DIRECTED / ST_SCANNING_GENERAL / ST_BACKOFF in that
+         * case, and the watchdog wouldn't have been armed by the scan-
+         * result handler. That's the c=1 / wdc=0 wedge shape we've been
+         * seeing. Arm the watchdog HERE unconditionally so the chain is
+         * covered regardless of who initiated the connect. */
+        central_state_t prev_state = S.state;
         if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
         S.conn_id = p->connect.conn_id;
         S.last_seen_us = esp_timer_get_time();
         S.state = ST_DISCOVERING;
         S.connects++;
-        cb_log("central: connected, conn_id=%u", S.conn_id);
+        arm_connect_watchdog();
+        cb_log("central: connected, conn_id=%u (was %s)",
+               (unsigned)S.conn_id, state_name(prev_state));
         /* Negotiate larger MTU; safe default 200, falls back to 23 on
          * peripherals that decline. */
         esp_ble_gattc_send_mtu_req(gattc_if, S.conn_id);
         break;
+    }
 
     case ESP_GATTC_OPEN_EVT:
         if (p->open.status != ESP_GATT_OK) {
