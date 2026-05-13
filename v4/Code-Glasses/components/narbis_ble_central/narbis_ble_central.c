@@ -190,6 +190,7 @@ static struct {
     uint32_t searches;       /* ESP_GATTC_SEARCH_RES_EVT count */
     uint32_t wd_armed;       /* arm_connect_watchdog() calls */
     uint32_t wd_fires;       /* connect_watchdog_cb() fires that passed state guard */
+    uint32_t self_heals;     /* emit_diag self-heal fires (post + pre-discovery) */
 
     /* When true, the central is paused (e.g. dashboard set HR source to
      * H10 — no need to keep scanning for earclip). Stops scans/backoff
@@ -1150,20 +1151,48 @@ void narbis_central_emit_diag(void) {
            (unsigned)S.notify_diag_count, (unsigned)S.notify_other_count);
     /* Chain progress: pairs with the relay state= line to localize wedges
      * that happen before the dashboard subscribes (one-shot CONNECT/MTU/
-     * SEARCH events otherwise leave no BLE-visible trace). */
-    cb_log("chain c=%u d=%u mtu=%u srch=%u wd_arm=%u wd_fire=%u",
+     * SEARCH events otherwise leave no BLE-visible trace). wd_ok=0 means
+     * S.connect_watchdog is NULL — the timer-based watchdog is disabled
+     * (likely esp_timer_create failed at init) and any wedge in
+     * CONNECTING/DISCOVERING is unrecoverable without the self-heal
+     * fallback below. sh = self-heal fires since boot. */
+    cb_log("chain c=%u d=%u mtu=%u srch=%u wd_arm=%u wd_fire=%u wd_ok=%d sh=%u",
            (unsigned)S.connects, (unsigned)S.disconnects,
            (unsigned)S.mtus, (unsigned)S.searches,
-           (unsigned)S.wd_armed, (unsigned)S.wd_fires);
+           (unsigned)S.wd_armed, (unsigned)S.wd_fires,
+           S.connect_watchdog ? 1 : 0,
+           (unsigned)S.self_heals);
     /* Self-heal: if we have an active conn_id AND IBI/CCCD handles
      * cached, the state machine got stuck somewhere mid-chain. Force
      * READY (which now also re-issues register_for_notify + CCCD
      * writes + initial CONFIG read, idempotent), so downstream data
      * actually starts flowing. */
     if (S.state != ST_READY && S.conn_id != 0 && S.hdl_ibi != 0) {
+        S.self_heals++;
         cb_log("self-heal: handles cached + conn_id=%u — forcing READY",
                S.conn_id);
         enter_ready();
+    }
+    /* Pre-discovery wedge fallback: post-CONNECT_EVT but no handles cached
+     * yet (MTU exchange or service discovery never completed). Same shape
+     * as PR #6's timer-based watchdog, but driven by the diag tick so it
+     * still recovers when wd_ok=0. Gate on >15 s elapsed since CONNECT_EVT
+     * (S.last_seen_us is set at line ~763) so we don't race a legitimate
+     * in-flight discovery. emit_diag runs at dashboard-connect AND on the
+     * ~30 s periodic alive log, so worst-case recovery time is ~45 s after
+     * the wedge starts. */
+    else if (S.state >= ST_DISCOVERING && S.state < ST_READY &&
+             S.conn_id != 0 && S.hdl_ibi == 0 &&
+             S.last_seen_us != 0 &&
+             (esp_timer_get_time() - S.last_seen_us) > (int64_t)CONNECT_WATCHDOG_MS * 1000LL) {
+        int64_t elapsed_ms = (esp_timer_get_time() - S.last_seen_us) / 1000;
+        S.self_heals++;
+        cb_log("self-heal: pre-discovery wedge (%lld ms, state=%s) — force-disconnect",
+               (long long)elapsed_ms, state_name(S.state));
+        (void)esp_ble_gattc_close(S.gattc_if, S.conn_id);
+        S.conn_id = 0;
+        (void)esp_ble_gap_disconnect(S.earclip_mac);
+        schedule_reconnect_backoff();
     }
 }
 
