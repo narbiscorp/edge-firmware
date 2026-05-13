@@ -795,6 +795,14 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.state = ST_DISCOVERING;
         S.connects++;
         arm_connect_watchdog();
+        /* Defense-in-depth: invalidate any Bluedroid GATT cache for this
+         * peer before doing MTU + search_service. If Bluedroid auto-
+         * reconnected from a cached prior session, the cache may have
+         * stale handles and search_service will short-circuit with no
+         * SEARCH_RES_EVT. cache_refresh forces a fresh discovery on the
+         * link we just established. Pair with the cache_clean at boot
+         * in narbis_central_start. */
+        (void)esp_ble_gattc_cache_refresh(p->connect.remote_bda);
         cb_log("central: connected, conn_id=%u (was %s)",
                (unsigned)S.conn_id, state_name(prev_state));
         /* Negotiate larger MTU; safe default 200, falls back to 23 on
@@ -1040,6 +1048,18 @@ esp_err_t narbis_central_start(void) {
         S.earclip_known = true;
         ESP_LOGI(TAG, "central: NVS earclip %02x:%02x:%02x:%02x:%02x:%02x",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        /* Wipe any Bluedroid-cached GATT service info for this peer.
+         * Bluedroid persists service caches (sometimes implicitly,
+         * especially when bonding was previously enabled) and on next
+         * connect will short-circuit search_service — firing
+         * SEARCH_CMPL_EVT with no SEARCH_RES_EVT in between. The central
+         * sees svc_start_handle=0, logs "service not found", calls
+         * gattc_close, then re-cycles. d=0 c=2 srch=0 in chain diag.
+         * Cleaning the cache forces a fresh over-the-air discovery on
+         * the next connect, which actually produces SEARCH_RES_EVT and
+         * lets us cache real handles. */
+        esp_err_t cc = esp_ble_gattc_cache_clean(S.earclip_mac);
+        ESP_LOGI(TAG, "central: cache_clean rc=%s", esp_err_to_name(cc));
         start_scan_directed();
     } else {
         S.earclip_known = false;
