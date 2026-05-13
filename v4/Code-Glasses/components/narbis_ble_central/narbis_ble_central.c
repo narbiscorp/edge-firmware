@@ -1088,6 +1088,23 @@ esp_err_t narbis_central_start(void) {
          * lets us cache real handles. */
         esp_err_t cc = esp_ble_gattc_cache_clean(S.earclip_mac);
         ESP_LOGI(TAG, "central: cache_clean rc=%s", esp_err_to_name(cc));
+        /* Pre-emptive disconnect of any Bluedroid-side persistent link to
+         * the saved peer. Symptom: c=1 with wdc=1 (only the CONNECT_EVT-
+         * level arm fired) means the connection came from Bluedroid auto-
+         * reconnect, bypassing our scan handler. After our watchdog/self-
+         * heal "force-disconnect" the BLE link sometimes stays alive at
+         * the controller level (no DISCONNECT_EVT, d=0 in chain) — the
+         * earclip's LED keeps showing connected and our directed scan
+         * sees no matching adv ("757 adv seen, target not found") because
+         * Bluedroid filters out advs from peers it considers connected.
+         * Calling gap_disconnect on the saved MAC here knocks the stale
+         * link loose so our scan actually sees the earclip's adv. The
+         * second call clears the accept list / RPA list — Bluedroid uses
+         * these to short-circuit reconnects without us asking. */
+        (void)esp_ble_gap_disconnect(S.earclip_mac);
+        esp_err_t wl = esp_ble_gap_clear_whitelist();
+        ESP_LOGI(TAG, "central: pre-scan disconnect + clear_whitelist rc=%s",
+                 esp_err_to_name(wl));
         start_scan_directed();
     } else {
         S.earclip_known = false;
