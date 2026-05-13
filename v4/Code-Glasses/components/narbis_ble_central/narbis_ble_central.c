@@ -59,6 +59,16 @@ static const char *TAG = "narbis_central";
 #define SCAN_GENERAL_S             30
 #define RECONNECT_BACKOFF_MS       5000
 
+/* Watchdog for the connect+discover+subscribe chain. Armed right after
+ * each esp_ble_gattc_open() call. If state hasn't progressed to
+ * ST_READY by the time this fires, we assume Bluedroid wedged (silent
+ * gattc_open with no follow-up CONNECT_EVT/OPEN_EVT, or service
+ * discovery stuck after CONNECT_EVT) and force-recover. 15 s is well
+ * above the normal worst-case observed in logs (~13 s end-to-end on a
+ * slow earclip + busy controller) but tight enough that the user
+ * doesn't sit through 30 s of staring at a stuck "DISCOVER" state. */
+#define CONNECT_WATCHDOG_MS        15000
+
 /* CCCD descriptor UUID (BLE-spec well-known). */
 #define BLE_UUID_CCCD              0x2902
 
@@ -136,6 +146,17 @@ static struct {
 
     /* esp_timer for the 30 s reconnect backoff. */
     esp_timer_handle_t backoff_timer;
+
+    /* esp_timer watchdog for the full connect+discover chain. Armed
+     * after every esp_ble_gattc_open() call. If the chain hasn't
+     * reached ST_READY within CONNECT_WATCHDOG_MS, fires force-recovery
+     * (gap_disconnect + gattc_close + schedule_reconnect_backoff). This
+     * is the safety net for Bluedroid's well-known silent wedge where
+     * gattc_open() returns ESP_OK but neither CONNECT_EVT nor OPEN_EVT
+     * ever fires — leaving the central stuck in ST_CONNECTING forever,
+     * or stuck in ST_DISCOVERING if CONNECT_EVT fires but the MTU /
+     * service-discovery / write-role / subscribe sub-chain stalls. */
+    esp_timer_handle_t connect_watchdog;
 
     /* Scan diagnostics — counted during each scan window, logged at
      * SCAN_INQ_CMPL_EVT. Tells us whether the central is seeing adverts
@@ -303,6 +324,48 @@ static void schedule_reconnect_backoff(void) {
     esp_timer_start_once(S.backoff_timer, (uint64_t)RECONNECT_BACKOFF_MS * 1000ULL);
 }
 
+/* Forward decl — watchdog cb references state_name() defined later. */
+static const char *state_name(central_state_t s);
+
+static void cancel_connect_watchdog(void) {
+    if (S.connect_watchdog) esp_timer_stop(S.connect_watchdog);
+}
+
+static void arm_connect_watchdog(void) {
+    if (!S.connect_watchdog) return;
+    esp_timer_stop(S.connect_watchdog);
+    esp_timer_start_once(S.connect_watchdog,
+                         (uint64_t)CONNECT_WATCHDOG_MS * 1000ULL);
+}
+
+static void connect_watchdog_cb(void *arg) {
+    (void)arg;
+    /* Only fire if we're actually mid-chain (CONNECTING through any
+     * subscribe step). If we already reached READY, or got cleanly
+     * thrown back to BACKOFF/scanning, ignore. */
+    if (S.state < ST_CONNECTING || S.state >= ST_READY) {
+        return;
+    }
+    cb_log("central: connect watchdog %dms in state=%s — force recovery",
+           CONNECT_WATCHDOG_MS, state_name(S.state));
+    /* Clear any phantom GATTC handle we may be holding. */
+    if (S.conn_id != 0) {
+        (void)esp_ble_gattc_close(S.gattc_if, S.conn_id);
+        S.conn_id = 0;
+    }
+    /* Force the link down at the GAP layer. No-op if Bluedroid had no
+     * actual connection — that's fine, gattc_close + this together
+     * covers both the "stuck open" and "actually connected mid-discovery"
+     * shapes. */
+    (void)esp_ble_gap_disconnect(S.earclip_mac);
+    /* Schedule the standard backoff so we don't spin. If
+     * ESP_GATTC_DISCONNECT_EVT fires from the force-disconnect above,
+     * its handler will already restart the scan; schedule_reconnect_backoff
+     * here is the safety net in case the disconnect was a no-op (no
+     * Bluedroid connection to drop). */
+    schedule_reconnect_backoff();
+}
+
 static void backoff_timer_cb(void *arg) {
     (void)arg;
     if (S.paused) {
@@ -364,6 +427,7 @@ static void advance_to_raw_or_ready(void);
  * populates immediately on relay-up. */
 static void enter_ready(void) {
     S.state = ST_READY;
+    cancel_connect_watchdog();
 
     /* Bluedroid requires register_for_notify to dispatch incoming
      * notifies to gattc_cb. Without it, even a CCCD-enabled peer's
@@ -610,6 +674,8 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
                             cb_log("central: gattc_open rc=%s — backing off",
                                    esp_err_to_name(oerr));
                             schedule_reconnect_backoff();
+                        } else {
+                            arm_connect_watchdog();
                         }
                     } else {
                         schedule_reconnect_backoff();
@@ -644,6 +710,8 @@ void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
                     cb_log("central: gattc_open rc=%s — backing off",
                            esp_err_to_name(oerr));
                     schedule_reconnect_backoff();
+                } else {
+                    arm_connect_watchdog();
                 }
             }
         } else if (S.state == ST_SCANNING_GENERAL) {
@@ -841,6 +909,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
 
     case ESP_GATTC_DISCONNECT_EVT:
         cb_log("central: disconnected reason=%d", p->disconnect.reason);
+        cancel_connect_watchdog();
         emit_state(false);
         /* Unregister all per-char notify registrations so they don't
          * pile up in Bluedroid's internal table (default cap of 5
@@ -909,6 +978,12 @@ esp_err_t narbis_central_init(narbis_central_ibi_cb_t     ibi_cb,
     };
     if ((err = esp_timer_create(&targs, &S.backoff_timer)) != ESP_OK) return err;
 
+    const esp_timer_create_args_t wargs = {
+        .callback = connect_watchdog_cb,
+        .name = "narbis_central_watchdog",
+    };
+    if ((err = esp_timer_create(&wargs, &S.connect_watchdog)) != ESP_OK) return err;
+
     ESP_LOGI(TAG, "central init ok");
     return ESP_OK;
 }
@@ -939,6 +1014,7 @@ esp_err_t narbis_central_start(void) {
 esp_err_t narbis_central_stop(void) {
     ESP_LOGI(TAG, "central: stop (HR source switched away from earclip)");
     S.paused = true;
+    cancel_connect_watchdog();
     /* Close any active connection; the DISCONNECT_EVT handler sees
      * S.paused=true and skips the auto-restart-scan. */
     if (S.conn_id) {
@@ -959,6 +1035,7 @@ esp_err_t narbis_central_stop(void) {
 
 esp_err_t narbis_central_forget(void) {
     ESP_LOGW(TAG, "central: forget paired earclip");
+    cancel_connect_watchdog();
     if (S.conn_id) {
         esp_ble_gattc_close(S.gattc_if, S.conn_id);
     }
