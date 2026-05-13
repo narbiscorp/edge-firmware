@@ -175,6 +175,22 @@ static struct {
     uint32_t notify_diag_count;
     uint32_t notify_other_count;
 
+    /* Chain-event counters — printed in diag so we can see whether the
+     * connect/discover/subscribe chain progressed at all during boot, even
+     * if the dashboard wasn't subscribed to the log sink when those
+     * one-shot events happened. Specifically: if state=DISCOVER persists
+     * with hdl_ibi=0, look at wd_armed/wd_fires to tell apart "watchdog
+     * never armed" (gattc_open failed) from "watchdog armed but didn't
+     * fire yet" from "watchdog fired and forced recovery". Pair `connects`
+     * vs `searches` to localize whether the stall is at MTU exchange or
+     * search_service. */
+    uint32_t connects;       /* ESP_GATTC_CONNECT_EVT count */
+    uint32_t disconnects;    /* ESP_GATTC_DISCONNECT_EVT count */
+    uint32_t mtus;           /* ESP_GATTC_CFG_MTU_EVT count */
+    uint32_t searches;       /* ESP_GATTC_SEARCH_RES_EVT count */
+    uint32_t wd_armed;       /* arm_connect_watchdog() calls */
+    uint32_t wd_fires;       /* connect_watchdog_cb() fires that passed state guard */
+
     /* When true, the central is paused (e.g. dashboard set HR source to
      * H10 — no need to keep scanning for earclip). Stops scans/backoff
      * timers from running and prevents disconnect-event auto-restart.
@@ -336,6 +352,7 @@ static void arm_connect_watchdog(void) {
     esp_timer_stop(S.connect_watchdog);
     esp_timer_start_once(S.connect_watchdog,
                          (uint64_t)CONNECT_WATCHDOG_MS * 1000ULL);
+    S.wd_armed++;
 }
 
 static void connect_watchdog_cb(void *arg) {
@@ -346,6 +363,7 @@ static void connect_watchdog_cb(void *arg) {
     if (S.state < ST_CONNECTING || S.state >= ST_READY) {
         return;
     }
+    S.wd_fires++;
     cb_log("central: connect watchdog %dms in state=%s — force recovery",
            CONNECT_WATCHDOG_MS, state_name(S.state));
     /* Clear any phantom GATTC handle we may be holding. */
@@ -762,6 +780,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.conn_id = p->connect.conn_id;
         S.last_seen_us = esp_timer_get_time();
         S.state = ST_DISCOVERING;
+        S.connects++;
         cb_log("central: connected, conn_id=%u", S.conn_id);
         /* Negotiate larger MTU; safe default 200, falls back to 23 on
          * peripherals that decline. */
@@ -790,6 +809,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         break;
 
     case ESP_GATTC_CFG_MTU_EVT:
+        S.mtus++;
         ESP_LOGI(TAG, "central: mtu=%u", p->cfg_mtu.mtu);
         /* Kick off service discovery for our 128-bit service UUID only. */
         {
@@ -800,6 +820,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         break;
 
     case ESP_GATTC_SEARCH_RES_EVT:
+        S.searches++;
         S.svc_start_handle = p->search_res.start_handle;
         S.svc_end_handle   = p->search_res.end_handle;
         ESP_LOGI(TAG, "central: svc handles %u..%u",
@@ -908,6 +929,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     }
 
     case ESP_GATTC_DISCONNECT_EVT:
+        S.disconnects++;
         cb_log("central: disconnected reason=%d", p->disconnect.reason);
         cancel_connect_watchdog();
         emit_state(false);
@@ -1126,6 +1148,13 @@ void narbis_central_emit_diag(void) {
            (unsigned)S.notify_ibi_count, (unsigned)S.notify_config_count,
            (unsigned)S.notify_batt_count, (unsigned)S.notify_raw_count,
            (unsigned)S.notify_diag_count, (unsigned)S.notify_other_count);
+    /* Chain progress: pairs with the relay state= line to localize wedges
+     * that happen before the dashboard subscribes (one-shot CONNECT/MTU/
+     * SEARCH events otherwise leave no BLE-visible trace). */
+    cb_log("chain c=%u d=%u mtu=%u srch=%u wd_arm=%u wd_fire=%u",
+           (unsigned)S.connects, (unsigned)S.disconnects,
+           (unsigned)S.mtus, (unsigned)S.searches,
+           (unsigned)S.wd_armed, (unsigned)S.wd_fires);
     /* Self-heal: if we have an active conn_id AND IBI/CCCD handles
      * cached, the state machine got stuck somewhere mid-chain. Force
      * READY (which now also re-issues register_for_notify + CCCD
