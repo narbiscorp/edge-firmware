@@ -1633,7 +1633,10 @@ static const char *TAG = "SG_v4.14.39";
                                          * above the 50ms debounce floor so
                                          * real noise is still rejected. */
 #define HALL_SHORT_MAX_MS       4000    /* Short gesture upper bound */
-#define HALL_LONG_MS            5000    /* Long hold → sleep */
+#define HALL_LONG_MS            3000    /* Long hold → sleep (was 5000;
+                                         * shortened so the gesture feels
+                                         * snappier — 3 s is still well
+                                         * past any accidental brush) */
 
 /* PWM Channel 1 - GPIO27 */
 #define PWM1_TIMER              LEDC_TIMER_0
@@ -3590,17 +3593,41 @@ static void led_task(void *param) {
  ******************************************************************************/
 static void enter_deep_sleep(void) {
     ESP_LOGI(TAG, "Entering deep sleep...");
-    
+
+    /* Belt-and-suspenders: every caller already sets this, but set it
+     * here too so the led_task / strobe ISR start unwinding before we
+     * drive the lens directly for the sleep indicator. */
+    session_active = false;
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* Sleep indicator: 6 fast lens-tint pulses (~3 s total). Written
+     * inline (not via indicator_trigger) so it bypasses the indicator
+     * system's 2 s pre-delay and 1.5 s-per-pulse cadence — the user
+     * just held the hall for 3 s, they want immediate feedback that
+     * the gesture registered. 500 ms per cycle (150 ms dark + 350 ms
+     * clear) is distinct from:
+     *   - per-program indicator pulses (slow, 1500 ms each)
+     *   - per-beat stream-pattern flashes (single short flash per IBI,
+     *     irregular rhythm ~1 Hz)
+     * so the user can tell "I'm going to sleep" from "I lost the
+     * sensor mid-stream". */
+    for (int i = 0; i < 6; i++) {
+        effective_duty = 100;  /* dark */
+        vTaskDelay(pdMS_TO_TICKS(150));
+        effective_duty = 0;    /* clear */
+        vTaskDelay(pdMS_TO_TICKS(350));
+    }
+
     /* Clear lens and stop unified timer */
     effective_duty = 0;
     vTaskDelay(pdMS_TO_TICKS(10));  /* Let timer apply zero duty */
     gptimer_stop(drive_timer);
     gptimer_disable(drive_timer);
     pwm_both_off();
-    
+
     /* Configure wake on Hall sensor LOW (arm opened) */
     esp_sleep_enable_ext0_wakeup(HALL_PIN, 0);
-    
+
     esp_deep_sleep_start();
 }
 
