@@ -1150,11 +1150,15 @@ void narbis_central_emit_diag(void) {
            (unsigned)S.notify_diag_count, (unsigned)S.notify_other_count);
     /* Chain progress: pairs with the relay state= line to localize wedges
      * that happen before the dashboard subscribes (one-shot CONNECT/MTU/
-     * SEARCH events otherwise leave no BLE-visible trace). */
-    cb_log("chain c=%u d=%u mtu=%u srch=%u wd_arm=%u wd_fire=%u",
+     * SEARCH events otherwise leave no BLE-visible trace). wd_ok=0 means
+     * esp_timer_create for the watchdog returned non-OK at init — the
+     * arm/fire path can never run and the watchdog is effectively
+     * disabled, so a c=1 / wd_arm=0 wedge is unrecoverable until forget. */
+    cb_log("chain c=%u d=%u mtu=%u srch=%u wd_arm=%u wd_fire=%u wd_ok=%d",
            (unsigned)S.connects, (unsigned)S.disconnects,
            (unsigned)S.mtus, (unsigned)S.searches,
-           (unsigned)S.wd_armed, (unsigned)S.wd_fires);
+           (unsigned)S.wd_armed, (unsigned)S.wd_fires,
+           S.connect_watchdog ? 1 : 0);
     /* Self-heal: if we have an active conn_id AND IBI/CCCD handles
      * cached, the state machine got stuck somewhere mid-chain. Force
      * READY (which now also re-issues register_for_notify + CCCD
