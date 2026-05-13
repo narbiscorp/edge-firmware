@@ -6226,6 +6226,35 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     ESP_ERROR_CHECK(ble_stack_init());
 
+    /* Clear any stale BLE bonds left over from older firmware builds that
+     * had CONFIG_BT_BLE_SMP_BOND_NVS_FLASH=y. Existing bonds in Bluedroid's
+     * NVS trigger auto-reconnect to the bonded peer on every boot —
+     * Bluedroid completes MTU / service discovery / CCCD-subscribe
+     * internally using cached service handles and never delivers any of
+     * those events to our gattc_cb. The central state machine ends up
+     * wedged at ST_DISCOVERING with handles 0/0 (c=1 wdc=0 in the chain
+     * diag) while the earclip thinks the link is up and is streaming.
+     * Without this clear, the wedge persists until self-heal fires or
+     * the user 0xC1-forgets. */
+    {
+        int bond_count = esp_ble_get_bond_device_num();
+        if (bond_count > 0) {
+            ESP_LOGW(TAG, "clearing %d stale BLE bond%s",
+                     bond_count, bond_count == 1 ? "" : "s");
+            esp_ble_bond_dev_t *bonds =
+                malloc((size_t)bond_count * sizeof(esp_ble_bond_dev_t));
+            if (bonds != NULL) {
+                esp_ble_get_bond_device_list(&bond_count, bonds);
+                for (int i = 0; i < bond_count; i++) {
+                    esp_ble_remove_bond_device(bonds[i].bd_addr);
+                }
+                free(bonds);
+            } else {
+                ESP_LOGE(TAG, "malloc(bonds) failed — leaving bonds in place");
+            }
+        }
+    }
+
     /* Path B: bring up the BLE central role on top of the existing
      * peripheral. Bluedroid is dual-role with CONFIG_BT_BLE_DUAL_ROLE=y
      * (see sdkconfig.defaults). The central registers a separate gattc

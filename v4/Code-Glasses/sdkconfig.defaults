@@ -5,6 +5,16 @@ CONFIG_BT_ENABLED=y
 CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
 
+# Disable persistent SMP bonding. The central uses ESP_GATT_AUTH_REQ_NONE
+# (no encryption) and the design is MAC-based pairing (NVS-saved earclip
+# MAC, plain GATT). Bonded peers in Bluedroid's SMP NVS would otherwise
+# trigger auto-reconnect on every boot — Bluedroid completes MTU /
+# discovery / subscribe internally using cached handles and never calls
+# our gattc_cb, leaving the central state machine wedged at ST_DISCOVERING
+# (c=1 wdc=0 in chain diag) while the earclip thinks the link is up and
+# is streaming. See narbis_ble_central.c arm-on-CONNECT_EVT discussion.
+CONFIG_BT_BLE_SMP_BOND_NVS_FLASH=n
+
 # CPU frequency 80MHz (saves ~20mA vs 160MHz)
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=80
