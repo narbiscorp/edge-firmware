@@ -188,7 +188,8 @@ static struct {
     uint32_t disconnects;    /* ESP_GATTC_DISCONNECT_EVT count */
     uint32_t mtus;           /* ESP_GATTC_CFG_MTU_EVT count */
     uint32_t searches;       /* ESP_GATTC_SEARCH_RES_EVT count */
-    uint32_t wd_armed;       /* arm_connect_watchdog() calls */
+    uint32_t wd_calls;       /* arm_connect_watchdog() function entries (before NULL check) */
+    uint32_t wd_armed;       /* arm_connect_watchdog() reached esp_timer_start_once */
     uint32_t wd_fires;       /* connect_watchdog_cb() fires that passed state guard */
     uint32_t self_heals;     /* emit_diag self-heal fires (post + pre-discovery) */
 
@@ -349,6 +350,7 @@ static void cancel_connect_watchdog(void) {
 }
 
 static void arm_connect_watchdog(void) {
+    S.wd_calls++;
     if (!S.connect_watchdog) return;
     esp_timer_stop(S.connect_watchdog);
     esp_timer_start_once(S.connect_watchdog,
@@ -1156,39 +1158,43 @@ void narbis_central_emit_diag(void) {
      * (likely esp_timer_create failed at init) and any wedge in
      * CONNECTING/DISCOVERING is unrecoverable without the self-heal
      * fallback below. sh = self-heal fires since boot. */
-    cb_log("chain c=%u d=%u mtu=%u srch=%u wd_arm=%u wd_fire=%u wd_ok=%d sh=%u",
+    cb_log("chain c=%u d=%u mtu=%u srch=%u wdc=%u wda=%u wdf=%u wd_ok=%d sh=%u",
            (unsigned)S.connects, (unsigned)S.disconnects,
            (unsigned)S.mtus, (unsigned)S.searches,
-           (unsigned)S.wd_armed, (unsigned)S.wd_fires,
+           (unsigned)S.wd_calls, (unsigned)S.wd_armed, (unsigned)S.wd_fires,
            S.connect_watchdog ? 1 : 0,
            (unsigned)S.self_heals);
-    /* Self-heal: if we have an active conn_id AND IBI/CCCD handles
-     * cached, the state machine got stuck somewhere mid-chain. Force
-     * READY (which now also re-issues register_for_notify + CCCD
-     * writes + initial CONFIG read, idempotent), so downstream data
-     * actually starts flowing. */
-    if (S.state != ST_READY && S.conn_id != 0 && S.hdl_ibi != 0) {
+    /* Self-heal: handles cached but chain didn't reach READY — force the
+     * transition (idempotent re-register + CCCD writes inside enter_ready
+     * actually start data flow). Doesn't gate on S.conn_id because
+     * Bluedroid can legitimately assign conn_id=0; state >= ST_WRITING_ROLE
+     * already implies we're connected (handles are only cached after
+     * SEARCH_CMPL_EVT). */
+    if (S.state >= ST_WRITING_ROLE && S.state < ST_READY && S.hdl_ibi != 0) {
         S.self_heals++;
-        cb_log("self-heal: handles cached + conn_id=%u — forcing READY",
-               S.conn_id);
+        cb_log("self-heal: handles cached state=%s — forcing READY",
+               state_name(S.state));
         enter_ready();
     }
     /* Pre-discovery wedge fallback: post-CONNECT_EVT but no handles cached
      * yet (MTU exchange or service discovery never completed). Same shape
      * as PR #6's timer-based watchdog, but driven by the diag tick so it
-     * still recovers when wd_ok=0. Gate on >15 s elapsed since CONNECT_EVT
-     * (S.last_seen_us is set at line ~763) so we don't race a legitimate
-     * in-flight discovery. emit_diag runs at dashboard-connect AND on the
-     * ~30 s periodic alive log, so worst-case recovery time is ~45 s after
-     * the wedge starts. */
+     * still recovers when wd_ok=0 or the timer somehow isn't arming. Gate
+     * on >15 s elapsed since CONNECT_EVT (S.last_seen_us is set at line
+     * ~763) so we don't race a legitimate in-flight discovery. emit_diag
+     * runs at dashboard-connect AND on the ~30 s periodic alive log, so
+     * worst-case recovery time is ~45 s after the wedge starts.
+     * No conn_id != 0 check — Bluedroid can legitimately assign conn_id=0,
+     * and state == ST_DISCOVERING is only reachable via the CONNECT_EVT
+     * handler so we know there's an active link. */
     else if (S.state >= ST_DISCOVERING && S.state < ST_READY &&
-             S.conn_id != 0 && S.hdl_ibi == 0 &&
+             S.hdl_ibi == 0 &&
              S.last_seen_us != 0 &&
              (esp_timer_get_time() - S.last_seen_us) > (int64_t)CONNECT_WATCHDOG_MS * 1000LL) {
         int64_t elapsed_ms = (esp_timer_get_time() - S.last_seen_us) / 1000;
         S.self_heals++;
-        cb_log("self-heal: pre-discovery wedge (%lld ms, state=%s) — force-disconnect",
-               (long long)elapsed_ms, state_name(S.state));
+        cb_log("self-heal: pre-discovery wedge (%lld ms, state=%s conn_id=%u) — force-disconnect",
+               (long long)elapsed_ms, state_name(S.state), (unsigned)S.conn_id);
         (void)esp_ble_gattc_close(S.gattc_if, S.conn_id);
         S.conn_id = 0;
         (void)esp_ble_gap_disconnect(S.earclip_mac);
