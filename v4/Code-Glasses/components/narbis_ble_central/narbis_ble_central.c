@@ -107,6 +107,18 @@ static struct {
     narbis_central_diag_cb_t    diag_cb;         /* diagnostics relay */
     bool                        raw_enabled;     /* user toggle, latched */
     bool                        last_state_emitted;  /* dedup state edges */
+    /* Bluedroid link state, separate from our app state machine's
+     * S.state. Set on ESP_GATTC_CONNECT_EVT, cleared on
+     * ESP_GATTC_DISCONNECT_EVT and on any force-recovery path
+     * (connect_watchdog_cb, emit_diag pre-discovery self-heal,
+     * narbis_central_stop/forget). The dashboard's 0xF6 heartbeat
+     * uses this rather than S.state==ST_READY, so the relay-link
+     * badge reflects the actual BLE link the way the earclip's LED
+     * does — even when our app state machine is wedged mid-
+     * discovery and never reached READY. The chain counters
+     * (mtu, srch, hdl_ibi=X/Y) in the diag still tell the user
+     * whether our discovery chain completed end-to-end. */
+    bool                        peer_connected;
 
     /* Bluedroid handles. */
     esp_gatt_if_t gattc_if;
@@ -379,6 +391,12 @@ static void connect_watchdog_cb(void *arg) {
      * covers both the "stuck open" and "actually connected mid-discovery"
      * shapes. */
     (void)esp_ble_gap_disconnect(S.earclip_mac);
+    /* Link is gone from our perspective. Update the dashboard-visible
+     * link state so the badge stops showing "Earclip linked". If
+     * DISCONNECT_EVT also fires, the redundant emit_state(false) is a
+     * no-op due to the dedup check. */
+    S.peer_connected = false;
+    emit_state(false);
     /* Schedule the standard backoff so we don't spin. If
      * ESP_GATTC_DISCONNECT_EVT fires from the force-disconnect above,
      * its handler will already restart the scan; schedule_reconnect_backoff
@@ -792,8 +810,17 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
         S.conn_id = p->connect.conn_id;
         S.last_seen_us = esp_timer_get_time();
+        /* If we were already at READY before this CONNECT_EVT, Bluedroid
+         * silently re-cycled the link (no DISCONNECT_EVT to our cb). Reset
+         * the emit_state dedup so the next emit_state(true) from enter_ready
+         * actually fires; otherwise the dashboard badge stays stuck at the
+         * stale value. */
+        if (prev_state == ST_READY) {
+            emit_state(false);
+        }
         S.state = ST_DISCOVERING;
         S.connects++;
+        S.peer_connected = true;
         arm_connect_watchdog();
         /* Defense-in-depth: invalidate any Bluedroid GATT cache for this
          * peer before doing MTU + search_service. If Bluedroid auto-
@@ -954,6 +981,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
 
     case ESP_GATTC_DISCONNECT_EVT:
         S.disconnects++;
+        S.peer_connected = false;
         cb_log("central: disconnected reason=%d", p->disconnect.reason);
         cancel_connect_watchdog();
         emit_state(false);
@@ -1073,6 +1101,8 @@ esp_err_t narbis_central_stop(void) {
     ESP_LOGI(TAG, "central: stop (HR source switched away from earclip)");
     S.paused = true;
     cancel_connect_watchdog();
+    S.peer_connected = false;
+    emit_state(false);
     /* Close any active connection; the DISCONNECT_EVT handler sees
      * S.paused=true and skips the auto-restart-scan. */
     if (S.conn_id) {
@@ -1094,6 +1124,8 @@ esp_err_t narbis_central_stop(void) {
 esp_err_t narbis_central_forget(void) {
     ESP_LOGW(TAG, "central: forget paired earclip");
     cancel_connect_watchdog();
+    S.peer_connected = false;
+    emit_state(false);
     if (S.conn_id) {
         esp_ble_gattc_close(S.gattc_if, S.conn_id);
     }
@@ -1115,7 +1147,15 @@ esp_err_t narbis_central_forget(void) {
 }
 
 bool narbis_central_is_connected(void) {
-    return S.state == ST_READY;
+    /* Bluedroid link state, not app state machine. The dashboard's
+     * 0xF6 relay-link badge wants the same notion of "connected" that
+     * the earclip's LED uses (BLE link established), regardless of
+     * whether our state machine reached ST_READY. Returning state
+     * == ST_READY here caused the dashboard to stick at "scanning
+     * earclip" any time Bluedroid silently re-cycled the link, even
+     * while the earclip was happily streaming. The chain counters in
+     * the diag dump still report the app-state progress separately. */
+    return S.peer_connected;
 }
 
 /* ---- Path B Phase 1/2: config + raw relay setters ------------------- */
@@ -1231,6 +1271,8 @@ void narbis_central_emit_diag(void) {
         (void)esp_ble_gattc_close(S.gattc_if, S.conn_id);
         S.conn_id = 0;
         (void)esp_ble_gap_disconnect(S.earclip_mac);
+        S.peer_connected = false;
+        emit_state(false);
         schedule_reconnect_backoff();
     }
 }
