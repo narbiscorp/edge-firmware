@@ -851,9 +851,12 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                 adv_contains_narbis_svc(&fields)) {
                 S.scan_advs_matched++;
                 if (S.scan_advs_matched == 1) {
+                    /* NimBLE addr.val is little-endian wire order; print
+                     * val[5..0] to match display convention (matches
+                     * Bluedroid era logs + earclip serial output). */
                     cb_log("central: matched narbis adv %02x:%02x:%02x:%02x:%02x:%02x rssi=%d",
-                           r->addr.val[0], r->addr.val[1], r->addr.val[2],
-                           r->addr.val[3], r->addr.val[4], r->addr.val[5], r->rssi);
+                           r->addr.val[5], r->addr.val[4], r->addr.val[3],
+                           r->addr.val[2], r->addr.val[1], r->addr.val[0], r->rssi);
                 }
                 if (!S.best.valid || r->rssi > S.best.rssi) {
                     S.best.valid = true;
