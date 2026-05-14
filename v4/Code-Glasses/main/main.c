@@ -4758,15 +4758,18 @@ static void on_ble_sync(void) {
     rc = ble_att_set_preferred_mtu(247);
     if (rc != 0) ESP_LOGW(TAG, "preferred_mtu: %d", rc);
 
-    /* Uniform 0 dBm (Class-2 BLE default) across all TX types. ~4x connection
-     * range and ~2x advertising range vs the prior -6/-12 dBm scheme, at ~+1 mA
-     * avg current. HDL1 set explicitly since glasses run dual-role with up to
-     * 2 simultaneous connections (earclip + dashboard). */
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT,   ESP_PWR_LVL_N0);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,       ESP_PWR_LVL_N0);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN,      ESP_PWR_LVL_N0);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, ESP_PWR_LVL_N0);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL1, ESP_PWR_LVL_N0);
+    /* Uniform +9 dBm (ESP32 module max, FCC regulatory ceiling) across all TX
+     * types. ~11x connection range and ~5.6x advertising range vs the prior
+     * -6/-12 dBm scheme, at ~+3 mA avg current. TX burst peak ~180 mA — battery
+     * needs to handle this without sag. CONFIG_ESP_PHY_REDUCE_TX_POWER=y is set,
+     * so edge 2.4 GHz channels may be throttled slightly below +9 dBm by the
+     * PHY for compliance. HDL1 set explicitly since glasses run dual-role with
+     * up to 2 simultaneous connections (earclip + dashboard). */
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT,   ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,       ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN,      ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL1, ESP_PWR_LVL_P9);
 
     start_advertising();
 }
