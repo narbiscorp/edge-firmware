@@ -832,9 +832,30 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         (void)esp_ble_gattc_cache_refresh(p->connect.remote_bda);
         cb_log("central: connected, conn_id=%u (was %s)",
                (unsigned)S.conn_id, state_name(prev_state));
-        /* Negotiate larger MTU; safe default 200, falls back to 23 on
-         * peripherals that decline. */
-        esp_ble_gattc_send_mtu_req(gattc_if, S.conn_id);
+        /* Negotiate larger MTU; the peripheral may decline and we fall
+         * back to default 23. Don't gate further progress on CFG_MTU_EVT
+         * — observed Bluedroid quirk where the peer initiates MTU first
+         * and CFG_MTU_EVT never fires for our app-layer request. The
+         * earclip's NimBLE side completes MTU=247 fine, but we'd sit
+         * forever waiting for the EVT and the chain would never advance
+         * (chain c=N d=N mtu=0 srch=0 across multiple cycles). */
+        esp_err_t mrc = esp_ble_gattc_send_mtu_req(gattc_if, S.conn_id);
+        if (mrc != ESP_OK) {
+            cb_log("central: send_mtu_req rc=%s", esp_err_to_name(mrc));
+        }
+        /* Kick off service discovery immediately rather than waiting
+         * for CFG_MTU_EVT. Search runs fine at the default MTU (23 B);
+         * subsequent larger characteristic reads still benefit from
+         * MTU=247 once it's exchanged at the LL layer (Bluedroid
+         * handles this transparently). */
+        {
+            esp_bt_uuid_t svc = { .len = ESP_UUID_LEN_128 };
+            memcpy(svc.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
+            esp_err_t src = esp_ble_gattc_search_service(gattc_if, S.conn_id, &svc);
+            if (src != ESP_OK) {
+                cb_log("central: search_service rc=%s", esp_err_to_name(src));
+            }
+        }
         break;
     }
 
@@ -862,12 +883,12 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     case ESP_GATTC_CFG_MTU_EVT:
         S.mtus++;
         ESP_LOGI(TAG, "central: mtu=%u", p->cfg_mtu.mtu);
-        /* Kick off service discovery for our 128-bit service UUID only. */
-        {
-            esp_bt_uuid_t svc = { .len = ESP_UUID_LEN_128 };
-            memcpy(svc.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
-            esp_ble_gattc_search_service(gattc_if, S.conn_id, &svc);
-        }
+        /* Note: search_service was already kicked off from CONNECT_EVT
+         * — we no longer gate discovery on this event arriving, because
+         * Bluedroid sometimes never delivers it (peer-initiated MTU
+         * exchange or version quirks). This event is now purely
+         * informational; the mtu counter in the chain diag tells us
+         * whether MTU completion was reported back to us. */
         break;
 
     case ESP_GATTC_SEARCH_RES_EVT:
