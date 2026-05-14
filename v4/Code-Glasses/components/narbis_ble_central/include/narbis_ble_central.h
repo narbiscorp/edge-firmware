@@ -3,7 +3,8 @@
  *
  * Discovers a Narbis earclip, connects as a BLE central, writes its peer
  * role (NARBIS_PEER_ROLE_GLASSES) to the earclip, and subscribes to IBI
- * notifications. Wraps Bluedroid's GATTC API so main.c stays clean.
+ * notifications. Wraps NimBLE's GATTC API so main.c stays clean.
+ * (Migrated from Bluedroid; see NIMBLE_MIGRATION_HANDOFF.md.)
  *
  * Lifecycle:
  *   narbis_central_init(ibi_cb, batt_cb)    — register callbacks, alloc state
@@ -23,7 +24,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
-#include "esp_gap_ble_api.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,13 +52,6 @@ esp_err_t narbis_central_stop(void);
 esp_err_t narbis_central_forget(void);
 
 bool      narbis_central_is_connected(void);
-
-/* Bluedroid registers exactly one GAP callback per stack. main.c keeps
- * its existing gap_event_handler (advertising lifecycle, connection
- * params) and forwards every event to this hook so the central can see
- * scan results / scan-stop. Safe to call before init (no-op). */
-void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
-                              esp_ble_gap_cb_param_t *param);
 
 /* Optional log sink. When registered, the central forwards its key
  * scan/connect/subscribe/disconnect events to this function in addition

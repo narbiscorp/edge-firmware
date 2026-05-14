@@ -1,26 +1,36 @@
 /*
- * narbis_ble_central.c — Bluedroid GATTC client that connects to a Narbis
+ * narbis_ble_central.c — NimBLE GATTC client that connects to a Narbis
  * earclip, writes the peer-role byte (GLASSES = 0x02), and subscribes to
- * IBI (and optionally BATTERY) notifications.
+ * IBI / CONFIG / BATTERY / RAW / DIAG notifications.
  *
- * Discovery model (per Path B plan §3b):
+ * Migrated from Bluedroid (PRs #5-#20 and #41 of historical interest;
+ * see NIMBLE_MIGRATION_HANDOFF.md for the full diagnosis of why we left
+ * Bluedroid behind). NimBLE provides per-call callbacks and per-step
+ * GATT discovery primitives, which eliminate Bluedroid's host-layer
+ * silent event-drop pathology while keeping the protocol identical.
+ *
+ * Discovery model (unchanged from Path B):
  *   - Boot: read NVS "narbis_pair"/"earclip_mac".
- *       Present → directed scan 5 s + connect.
- *       Absent  → general scan 30 s, filter by NARBIS_SVC_UUID, pick
- *                 highest-RSSI hit, persist its MAC, connect.
- *   - On disconnect: directed scan 5 s; if not found, sleep 30 s, retry.
- *     Reconnect attempts capped at one per 30 s.
+ *       Present -> directed scan 30 s + connect.
+ *       Absent  -> general scan 30 s, filter by NARBIS_SVC_UUID, pick
+ *                  highest-RSSI hit, persist its MAC, connect.
+ *   - On disconnect: directed scan; if not found, backoff and retry.
  *
- * After connect:
- *   1. MTU exchange.
- *   2. Discover NARBIS_SVC_UUID, cache char handles.
- *   3. Write 1 byte 0x02 (NARBIS_PEER_ROLE_GLASSES) to PEER_ROLE.
- *   4. Subscribe to IBI (CCCD = 0x0001).
- *   5. Optionally subscribe to BATTERY.
- *   RAW_PPG is intentionally never subscribed — wastes air time + power
- *   for a stream the glasses do not use.
+ * Connect chain (9 numbered steps, preserved verbatim for dashboard log
+ * parsing):
+ *   1. CONNECT (BLE_GAP_EVENT_CONNECT)
+ *   2. MTU         (BLE_GAP_EVENT_MTU)
+ *   3. SEARCH_RES  (svc disc callback per match)
+ *   4. SEARCH_CMPL (svc disc callback EDONE)
+ *   5. WRITE_ROLE_ACK
+ *   6. SUB_IBI_ACK
+ *   7. SUB_CFG_ACK
+ *   8. SUB_BATT_ACK
+ *   9. READY
  *
- * No bonding / encryption — same threat model as the rest of v1.
+ * No bonding / encryption — same threat model as the rest of v1, and
+ * CONFIG_BT_NIMBLE_SM_LEGACY=n + CONFIG_BT_NIMBLE_SM_SC=n in sdkconfig
+ * make sure SMP code isn't compiled in.
  */
 
 #include "narbis_ble_central.h"
@@ -29,18 +39,18 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "esp_bt.h"
-#include "esp_bt_defs.h"
-#include "esp_bt_main.h"
-#include "esp_gap_ble_api.h"
-#include "esp_gattc_api.h"
-#include "esp_gatt_common_api.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include "host/ble_hs.h"
+#include "host/ble_gap.h"
+#include "host/ble_uuid.h"
+#include "host/ble_gatt.h"
+#include "host/util/util.h"
 
 #include "narbis_protocol.h"
 
@@ -49,28 +59,25 @@ static const char *TAG = "narbis_central";
 #define NARBIS_NVS_NS              "narbis_pair"
 #define NARBIS_NVS_KEY_EARCLIP_MAC "earclip_mac"
 
-#define NARBIS_GATTC_APP_ID        0x55  /* arbitrary; distinct from gatts app */
-
-/* Directed scan window for the persisted earclip MAC. 30 s scan + 5 s
- * backoff keeps the radio listening ~86 % of the time, so a wake/re-
- * entry of the earclip is caught within ~5 s. Earlier 5 s/30 s ratio
- * pushed worst-case reconnect to 35 s. */
-#define SCAN_DIRECTED_S            30
-#define SCAN_GENERAL_S             30
+/* Directed scan window for the persisted earclip MAC. 30 s window + ~5 s
+ * backoff keeps the radio listening most of the time so a wake/re-entry
+ * of the earclip is caught within ~5 s. */
+#define SCAN_DIRECTED_MS           30000
+#define SCAN_GENERAL_MS            30000
 #define RECONNECT_BACKOFF_MS       5000
 
 /* Watchdog for the connect+discover+subscribe chain. Armed right after
- * each esp_ble_gattc_open() call. If state hasn't progressed to
- * ST_READY by the time this fires, we assume Bluedroid wedged (silent
- * gattc_open with no follow-up CONNECT_EVT/OPEN_EVT, or service
- * discovery stuck after CONNECT_EVT) and force-recover. 15 s is well
- * above the normal worst-case observed in logs (~13 s end-to-end on a
- * slow earclip + busy controller) but tight enough that the user
- * doesn't sit through 30 s of staring at a stuck "DISCOVER" state. */
+ * each ble_gap_connect() call. If state hasn't progressed to ST_READY by
+ * the time this fires, we assume the chain wedged and force-recover.
+ * 15 s is well above normal end-to-end (~3-5 s on a healthy earclip) but
+ * tight enough that the user doesn't sit through 30 s of stuck DISCOVER. */
 #define CONNECT_WATCHDOG_MS        15000
 
 /* CCCD descriptor UUID (BLE-spec well-known). */
 #define BLE_UUID_CCCD              0x2902
+
+/* Connection sentinel (NimBLE's BLE_HS_CONN_HANDLE_NONE = 0xFFFF). */
+#define CONN_HANDLE_NONE           BLE_HS_CONN_HANDLE_NONE
 
 typedef enum {
     ST_IDLE = 0,
@@ -84,16 +91,26 @@ typedef enum {
     ST_READING_CONFIG_INITIAL,    /* one-shot read after CONFIG subscribe */
     ST_SUBSCRIBING_BATT,
     ST_SUBSCRIBING_RAW,           /* Path B Phase 2 (only if raw_enabled) */
+    ST_SUBSCRIBING_DIAG,
     ST_READY,
     ST_BACKOFF,
 } central_state_t;
 
 typedef struct {
-    uint8_t              bda[6];
-    esp_ble_addr_type_t  addr_type;  /* captured from scan; needed for gattc_open */
-    int                  rssi;
-    bool                 valid;
+    uint8_t  bda[6];
+    uint8_t  addr_type;        /* NimBLE ble_addr_t.type */
+    int      rssi;
+    bool     valid;
 } scan_best_t;
+
+/* Per-characteristic descriptor-discovery cursor — we discover all chars
+ * first, then walk each notify char's descriptor range looking for its
+ * CCCD. dsc_pending_idx points into the dsc_targets array below. */
+typedef struct {
+    uint16_t  *val_handle;     /* (filled by chr disc) */
+    uint16_t  *cccd_handle;    /* (filled by dsc disc when we find 0x2902 in range) */
+    uint16_t  next_chr_handle; /* first handle beyond this char (set after chr disc) */
+} dsc_target_t;
 
 static struct {
     central_state_t state;
@@ -102,84 +119,68 @@ static struct {
     narbis_central_battery_cb_t batt_cb;
     narbis_central_log_sink_t   log_sink;
     narbis_central_state_cb_t   state_cb;
-    narbis_central_config_cb_t  config_cb;       /* Path B Phase 1 */
-    narbis_central_raw_cb_t     raw_cb;          /* Path B Phase 2 */
-    narbis_central_diag_cb_t    diag_cb;         /* diagnostics relay */
-    bool                        raw_enabled;     /* user toggle, latched */
-    bool                        last_state_emitted;  /* dedup state edges */
-    /* Bluedroid link state, separate from our app state machine's
-     * S.state. Set on ESP_GATTC_CONNECT_EVT, cleared on
-     * ESP_GATTC_DISCONNECT_EVT and on any force-recovery path
-     * (connect_watchdog_cb, emit_diag pre-discovery self-heal,
-     * narbis_central_stop/forget). The dashboard's 0xF6 heartbeat
-     * uses this rather than S.state==ST_READY, so the relay-link
-     * badge reflects the actual BLE link the way the earclip's LED
-     * does — even when our app state machine is wedged mid-
-     * discovery and never reached READY. The chain counters
-     * (mtu, srch, hdl_ibi=X/Y) in the diag still tell the user
-     * whether our discovery chain completed end-to-end. */
+    narbis_central_config_cb_t  config_cb;
+    narbis_central_raw_cb_t     raw_cb;
+    narbis_central_diag_cb_t    diag_cb;
+    bool                        raw_enabled;
+    bool                        last_state_emitted;
+    /* Link state, separate from app state machine. Set on BLE_GAP_EVENT_
+     * CONNECT success, cleared on DISCONNECT and on any force-recovery.
+     * Dashboard's 0xF6 relay-link badge uses this so it reflects the
+     * actual BLE link even when our state machine is mid-chain. */
     bool                        peer_connected;
 
-    /* Bluedroid handles. */
-    esp_gatt_if_t gattc_if;
-    uint16_t      conn_id;
+    /* NimBLE connection handle. 0xFFFF when no link. */
+    uint16_t conn_handle;
+    uint8_t  own_addr_type;
+    bool     own_addr_resolved;
+    bool     start_pending;    /* narbis_central_start called before sync */
 
-    /* Cached service + char handles after discovery. */
+    /* Service handle range from svc discovery. */
     uint16_t svc_start_handle;
     uint16_t svc_end_handle;
-    uint16_t hdl_ibi;
-    uint16_t hdl_ibi_cccd;
-    uint16_t hdl_battery;
-    uint16_t hdl_battery_cccd;
+
+    /* Cached char + CCCD handles. */
+    uint16_t hdl_ibi;          uint16_t hdl_ibi_cccd;
+    uint16_t hdl_battery;      uint16_t hdl_battery_cccd;
     uint16_t hdl_peer_role;
-    uint16_t hdl_config;            /* Path B Phase 1: notify */
-    uint16_t hdl_config_cccd;
-    uint16_t hdl_config_write;      /* write-only, no CCCD */
-    uint16_t hdl_raw;               /* Path B Phase 2: notify */
-    uint16_t hdl_raw_cccd;
-    uint16_t hdl_diag;              /* Diagnostics: notify */
-    uint16_t hdl_diag_cccd;
+    uint16_t hdl_config;       uint16_t hdl_config_cccd;
+    uint16_t hdl_config_write;
+    uint16_t hdl_raw;          uint16_t hdl_raw_cccd;
+    uint16_t hdl_diag;         uint16_t hdl_diag_cccd;
+
+    /* Cursor + targets for descriptor discovery. We discover all dscs
+     * in the svc range in one shot; per-descriptor cb sorts them into
+     * the right char's CCCD slot by handle range. */
+    dsc_target_t dsc_targets[5];   /* IBI, BATTERY, CONFIG, RAW, DIAG */
+    int          dsc_target_count;
 
     /* Pairing target. */
-    uint8_t              earclip_mac[6];
-    esp_ble_addr_type_t  earclip_addr_type;  /* PUBLIC by default; populated from scan match
-                                              * — without this, gattc_open against a peer with
-                                              * a random address (NimBLE default on ESP32-C6 when
-                                              * no public BD_ADDR is in OTP) silently never fires
-                                              * OPEN_EVT and the central looks "stuck after persist". */
-    bool                 earclip_known;
+    uint8_t  earclip_mac[6];
+    uint8_t  earclip_addr_type;
+    bool     earclip_known;
 
-    /* General-scan winner-tracking. */
+    /* General-scan winner. */
     scan_best_t best;
 
     /* Reconnect bookkeeping. */
     uint32_t scan_attempts;
     int64_t  last_seen_us;
 
-    /* esp_timer for the 30 s reconnect backoff. */
+    /* esp_timer for the reconnect backoff. */
     esp_timer_handle_t backoff_timer;
 
-    /* esp_timer watchdog for the full connect+discover chain. Armed
-     * after every esp_ble_gattc_open() call. If the chain hasn't
-     * reached ST_READY within CONNECT_WATCHDOG_MS, fires force-recovery
-     * (gap_disconnect + gattc_close + schedule_reconnect_backoff). This
-     * is the safety net for Bluedroid's well-known silent wedge where
-     * gattc_open() returns ESP_OK but neither CONNECT_EVT nor OPEN_EVT
-     * ever fires — leaving the central stuck in ST_CONNECTING forever,
-     * or stuck in ST_DISCOVERING if CONNECT_EVT fires but the MTU /
-     * service-discovery / write-role / subscribe sub-chain stalls. */
+    /* esp_timer watchdog for the full connect+discover chain. Armed after
+     * every ble_gap_connect() call. Fires force-recovery
+     * (ble_gap_terminate + schedule_reconnect_backoff) if we don't reach
+     * ST_READY within CONNECT_WATCHDOG_MS. */
     esp_timer_handle_t connect_watchdog;
 
-    /* Scan diagnostics — counted during each scan window, logged at
-     * SCAN_INQ_CMPL_EVT. Tells us whether the central is seeing adverts
-     * at all, and whether any match the NARBIS service UUID. */
+    /* Scan diagnostics. */
     uint16_t scan_advs_seen;
     uint16_t scan_advs_matched;
 
-    /* Per-char notify counters — printed in diag so we can see which
-     * subscriptions are actually receiving data from the earclip. If
-     * state=READY but all counters stay 0, the earclip isn't sending
-     * (no finger on sensor) OR Bluedroid isn't dispatching to us. */
+    /* Per-char notify counters. */
     uint32_t notify_ibi_count;
     uint32_t notify_batt_count;
     uint32_t notify_config_count;
@@ -187,34 +188,55 @@ static struct {
     uint32_t notify_diag_count;
     uint32_t notify_other_count;
 
-    /* Chain-event counters — printed in diag so we can see whether the
-     * connect/discover/subscribe chain progressed at all during boot, even
-     * if the dashboard wasn't subscribed to the log sink when those
-     * one-shot events happened. Specifically: if state=DISCOVER persists
-     * with hdl_ibi=0, look at wd_armed/wd_fires to tell apart "watchdog
-     * never armed" (gattc_open failed) from "watchdog armed but didn't
-     * fire yet" from "watchdog fired and forced recovery". Pair `connects`
-     * vs `searches` to localize whether the stall is at MTU exchange or
-     * search_service. */
-    uint32_t connects;       /* ESP_GATTC_CONNECT_EVT count */
-    uint32_t disconnects;    /* ESP_GATTC_DISCONNECT_EVT count */
-    uint32_t mtus;           /* ESP_GATTC_CFG_MTU_EVT count */
-    uint32_t searches;       /* ESP_GATTC_SEARCH_RES_EVT count */
-    uint32_t wd_calls;       /* arm_connect_watchdog() function entries (before NULL check) */
-    uint32_t wd_armed;       /* arm_connect_watchdog() reached esp_timer_start_once */
-    uint32_t wd_fires;       /* connect_watchdog_cb() fires that passed state guard */
-    /* When true, the central is paused (e.g. dashboard set HR source to
-     * H10 — no need to keep scanning for earclip). Stops scans/backoff
-     * timers from running and prevents disconnect-event auto-restart.
-     * Cleared by narbis_central_start(). */
+    /* Chain-event counters — diagnose where a connect chain stalled. */
+    uint32_t connects;
+    uint32_t disconnects;
+    uint32_t mtus;
+    uint32_t searches;
+    uint32_t wd_calls;
+    uint32_t wd_armed;
+    uint32_t wd_fires;
+    /* When true, the central is paused — stops scans/backoff and prevents
+     * disconnect-event auto-restart. Cleared by narbis_central_start. */
     bool paused;
 } S;
 
+/* Forward decls — many of these reference each other in the chain. */
+static int  gap_event_cb(struct ble_gap_event *event, void *arg);
+static const char *state_name(central_state_t s);
+static void start_scan_directed(void);
+static void start_scan_general(void);
+static void schedule_reconnect_backoff(void);
+static void arm_connect_watchdog(void);
+static void cancel_connect_watchdog(void);
+static void initiate_connect(void);
+static int  on_mtu_complete(uint16_t conn_handle, const struct ble_gatt_error *err,
+                            uint16_t mtu, void *arg);
+static int  on_svc_disc(uint16_t conn_handle, const struct ble_gatt_error *err,
+                        const struct ble_gatt_svc *svc, void *arg);
+static int  on_chr_disc(uint16_t conn_handle, const struct ble_gatt_error *err,
+                        const struct ble_gatt_chr *chr, void *arg);
+static int  on_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *err,
+                        uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc,
+                        void *arg);
+static int  on_role_written(uint16_t conn_handle, const struct ble_gatt_error *err,
+                            struct ble_gatt_attr *attr, void *arg);
+static int  on_cccd_written(uint16_t conn_handle, const struct ble_gatt_error *err,
+                            struct ble_gatt_attr *attr, void *arg);
+static int  on_config_read(uint16_t conn_handle, const struct ble_gatt_error *err,
+                           struct ble_gatt_attr *attr, void *arg);
+static int  on_config_write_done(uint16_t conn_handle, const struct ble_gatt_error *err,
+                                 struct ble_gatt_attr *attr, void *arg);
+static void write_peer_role(void);
+static void cccd_subscribe_ibi(void);
+static void advance_to_config_or_batt_or_raw_or_diag_or_ready(void);
+static void advance_to_batt_or_raw_or_diag_or_ready(void);
+static void advance_to_raw_or_diag_or_ready(void);
+static void advance_to_diag_or_ready(void);
+static void enter_ready(void);
+
 /* ---- log sink + state callback helpers ------------------------------- */
 
-/* Mirror an ESP_LOG-style line to both ESP_LOG (UART) and the registered
- * sink (typically main.c's ble_log → 0xFF03 frame type 0xF1). The sink
- * sees the message without a newline; main.c's ble_log adds the framing. */
 static void cb_log(const char *fmt, ...) {
     char buf[96];
     va_list ap;
@@ -281,45 +303,62 @@ static esp_err_t nvs_erase_earclip(void) {
     return err;
 }
 
-/* ---- Scan helpers ---------------------------------------------------- */
+/* ---- UUIDs ----------------------------------------------------------- */
 
-/* The earclip's primary 128-bit service UUID, in Bluedroid little-endian
- * byte layout. Same bytes as protocol/narbis_protocol.h NARBIS_SVC_UUID_BYTES. */
-static const uint8_t NARBIS_SVC_UUID_LE[16] = NARBIS_SVC_UUID_BYTES;
+/* NimBLE ble_uuid128_t with little-endian 16-byte payload matching
+ * narbis_protocol.h NARBIS_*_UUID_BYTES. The byte layout is identical
+ * to what Bluedroid's esp_bt_uuid_t.uuid128 used (per the explicit
+ * note in narbis_protocol.h:50-60), so we reuse the same constants. */
+#define NARBIS_UUID128(name, bytes)                                       \
+    static const ble_uuid128_t name = {                                   \
+        .u = { .type = BLE_UUID_TYPE_128 },                               \
+        .value = bytes,                                                   \
+    }
 
-static bool adv_contains_narbis_svc(const uint8_t *adv, uint8_t adv_len) {
-    /* Walk the AD structure list looking for a "Complete List of 128-bit
-     * Service UUIDs" (0x07) or "Incomplete List..." (0x06) field that
-     * carries our UUID. */
-    uint8_t i = 0;
-    while (i + 1 < adv_len) {
-        uint8_t fld_len = adv[i];
-        if (fld_len == 0 || (i + 1 + fld_len) > adv_len) return false;
-        uint8_t type = adv[i + 1];
-        if (type == ESP_BLE_AD_TYPE_128SRV_CMPL || type == ESP_BLE_AD_TYPE_128SRV_PART) {
-            const uint8_t *uuids = &adv[i + 2];
-            uint8_t uuids_len = fld_len - 1;
-            for (uint8_t j = 0; j + 16 <= uuids_len; j += 16) {
-                if (memcmp(&uuids[j], NARBIS_SVC_UUID_LE, 16) == 0) return true;
-            }
+NARBIS_UUID128(UUID_SVC,           NARBIS_SVC_UUID_BYTES);
+NARBIS_UUID128(UUID_CHR_IBI,       NARBIS_CHR_IBI_UUID_BYTES);
+NARBIS_UUID128(UUID_CHR_BATTERY,   NARBIS_CHR_BATTERY_UUID_BYTES);
+NARBIS_UUID128(UUID_CHR_PEER_ROLE, NARBIS_CHR_PEER_ROLE_UUID_BYTES);
+NARBIS_UUID128(UUID_CHR_CONFIG,    NARBIS_CHR_CONFIG_UUID_BYTES);
+NARBIS_UUID128(UUID_CHR_CONFIG_WRITE, NARBIS_CHR_CONFIG_WRITE_UUID_BYTES);
+NARBIS_UUID128(UUID_CHR_RAW,       NARBIS_CHR_RAW_PPG_UUID_BYTES);
+NARBIS_UUID128(UUID_CHR_DIAG,      NARBIS_CHR_DIAGNOSTICS_UUID_BYTES);
+
+static const ble_uuid16_t UUID_CCCD = BLE_UUID16_INIT(BLE_UUID_CCCD);
+
+/* ---- Adv parsing for general scan ----------------------------------- */
+
+static bool adv_contains_narbis_svc(const struct ble_hs_adv_fields *fields) {
+    for (int i = 0; i < fields->num_uuids128; i++) {
+        if (ble_uuid_cmp(&fields->uuids128[i].u, &UUID_SVC.u) == 0) {
+            return true;
         }
-        i += 1 + fld_len;
     }
     return false;
 }
 
-static esp_ble_scan_params_t scan_params = {
-    .scan_type          = BLE_SCAN_TYPE_ACTIVE,
-    .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
-    .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
-    .scan_interval      = 0x50,    /* 50 ms */
-    .scan_window        = 0x30,    /* 30 ms */
-    .scan_duplicate     = BLE_SCAN_DUPLICATE_DISABLE,
-};
+/* ---- Scan ----------------------------------------------------------- */
+
+static struct ble_gap_disc_params build_disc_params(void) {
+    struct ble_gap_disc_params p = {0};
+    p.itvl   = 0x50;        /* 50 ms */
+    p.window = 0x30;        /* 30 ms */
+    p.filter_policy = BLE_HCI_SCAN_FILT_NO_WL;
+    p.passive = 0;          /* active scan */
+    p.limited = 0;
+    p.filter_duplicates = 0;
+    return p;
+}
+
+static bool host_synced(void) {
+    if (S.own_addr_resolved) return true;
+    int rc = ble_hs_id_infer_auto(0, &S.own_addr_type);
+    if (rc != 0) return false;
+    S.own_addr_resolved = true;
+    return true;
+}
 
 static void start_scan_directed(void) {
-    /* Cancel any pending backoff so we don't double-fire a scan when
-     * the timer expires after we're already scanning. */
     if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
     S.state = ST_SCANNING_DIRECTED;
     S.scan_attempts++;
@@ -328,8 +367,18 @@ static void start_scan_directed(void) {
                      : (int)((now - S.last_seen_us) / 1000000);
     cb_log("central: scanning attempt %lu, last seen %d s ago (directed)",
            (unsigned long)S.scan_attempts, last_seen_s);
-    esp_ble_gap_set_scan_params(&scan_params);
-    esp_ble_gap_start_scanning(SCAN_DIRECTED_S);
+    if (!host_synced()) {
+        cb_log("central: host not synced — will retry via backoff");
+        schedule_reconnect_backoff();
+        return;
+    }
+    struct ble_gap_disc_params dp = build_disc_params();
+    int rc = ble_gap_disc(S.own_addr_type, SCAN_DIRECTED_MS, &dp,
+                          gap_event_cb, NULL);
+    if (rc != 0) {
+        cb_log("central: ble_gap_disc rc=%d — backing off", rc);
+        schedule_reconnect_backoff();
+    }
 }
 
 static void start_scan_general(void) {
@@ -342,18 +391,29 @@ static void start_scan_general(void) {
                      : (int)((now - S.last_seen_us) / 1000000);
     cb_log("central: scanning attempt %lu, last seen %d s ago (general)",
            (unsigned long)S.scan_attempts, last_seen_s);
-    esp_ble_gap_set_scan_params(&scan_params);
-    esp_ble_gap_start_scanning(SCAN_GENERAL_S);
+    if (!host_synced()) {
+        cb_log("central: host not synced — will retry via backoff");
+        schedule_reconnect_backoff();
+        return;
+    }
+    struct ble_gap_disc_params dp = build_disc_params();
+    int rc = ble_gap_disc(S.own_addr_type, SCAN_GENERAL_MS, &dp,
+                          gap_event_cb, NULL);
+    if (rc != 0) {
+        cb_log("central: ble_gap_disc rc=%d — backing off", rc);
+        schedule_reconnect_backoff();
+    }
 }
 
 static void schedule_reconnect_backoff(void) {
     S.state = ST_BACKOFF;
     cb_log("central: backoff %d ms before next scan", RECONNECT_BACKOFF_MS);
-    esp_timer_start_once(S.backoff_timer, (uint64_t)RECONNECT_BACKOFF_MS * 1000ULL);
+    if (S.backoff_timer) {
+        esp_timer_start_once(S.backoff_timer, (uint64_t)RECONNECT_BACKOFF_MS * 1000ULL);
+    }
 }
 
-/* Forward decl — watchdog cb references state_name() defined later. */
-static const char *state_name(central_state_t s);
+/* ---- Watchdog ------------------------------------------------------- */
 
 static void cancel_connect_watchdog(void) {
     if (S.connect_watchdog) esp_timer_stop(S.connect_watchdog);
@@ -370,44 +430,19 @@ static void arm_connect_watchdog(void) {
 
 static void connect_watchdog_cb(void *arg) {
     (void)arg;
-    /* Only fire if we're actually mid-chain (CONNECTING through any
-     * subscribe step). If we already reached READY, or got cleanly
-     * thrown back to BACKOFF/scanning, ignore. */
-    if (S.state < ST_CONNECTING || S.state >= ST_READY) {
-        return;
-    }
+    if (S.state < ST_CONNECTING || S.state >= ST_READY) return;
     S.wd_fires++;
     cb_log("central: connect watchdog %dms in state=%s — force recovery",
            CONNECT_WATCHDOG_MS, state_name(S.state));
-    /* Clear any phantom GATTC handle we may be holding. */
-    if (S.conn_id != 0) {
-        (void)esp_ble_gattc_close(S.gattc_if, S.conn_id);
-        S.conn_id = 0;
+    /* If we have an established link, terminate it. Otherwise (still in
+     * ST_CONNECTING with no conn_handle yet), cancel the connect attempt. */
+    if (S.conn_handle != CONN_HANDLE_NONE) {
+        (void)ble_gap_terminate(S.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    } else {
+        (void)ble_gap_conn_cancel();
     }
-    /* Force the link down at the GAP layer. No-op if Bluedroid had no
-     * actual connection — that's fine, gattc_close + this together
-     * covers both the "stuck open" and "actually connected mid-discovery"
-     * shapes. */
-    (void)esp_ble_gap_disconnect(S.earclip_mac);
-    /* Observed (2026-05-14): after gap_disconnect at watchdog fire,
-     * DISCONNECT_EVT does NOT fire (chain d=0 stays) and the LL link
-     * remains alive from Bluedroid's perspective. The next directed scan
-     * sees hundreds of advs but filters the earclip's own adv out
-     * because Bluedroid considers it "still connected". Clearing the
-     * accept list / RPA list breaks Bluedroid's short-circuit and lets
-     * the next scan see the earclip. */
-    (void)esp_ble_gap_clear_whitelist();
-    /* Link is gone from our perspective. Update the dashboard-visible
-     * link state so the badge stops showing "Earclip linked". If
-     * DISCONNECT_EVT also fires, the redundant emit_state(false) is a
-     * no-op due to the dedup check. */
     S.peer_connected = false;
     emit_state(false);
-    /* Schedule the standard backoff so we don't spin. If
-     * ESP_GATTC_DISCONNECT_EVT fires from the force-disconnect above,
-     * its handler will already restart the scan; schedule_reconnect_backoff
-     * here is the safety net in case the disconnect was a no-op (no
-     * Bluedroid connection to drop). */
     schedule_reconnect_backoff();
 }
 
@@ -421,99 +456,332 @@ static void backoff_timer_cb(void *arg) {
     else                 start_scan_general();
 }
 
-/* ---- Subscribe to a notify char by writing 0x0001 to its CCCD ------- */
+/* ---- Connect initiation --------------------------------------------- */
 
-static void cccd_subscribe(uint16_t cccd_handle) {
-    uint8_t val[2] = { 0x01, 0x00 };
-    esp_err_t err = esp_ble_gattc_write_char_descr(
-        S.gattc_if, S.conn_id, cccd_handle,
-        sizeof(val), val,
-        ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "cccd_subscribe(%u) failed: %d", cccd_handle, err);
+static void initiate_connect(void) {
+    S.state = ST_CONNECTING;
+    S.last_seen_us = esp_timer_get_time();
+    ble_addr_t peer = {0};
+    peer.type = S.earclip_addr_type;
+    memcpy(peer.val, S.earclip_mac, 6);
+    int rc = ble_gap_connect(S.own_addr_type, &peer, 30000 /* ms */,
+                             NULL /* default conn params */,
+                             gap_event_cb, NULL);
+    if (rc != 0) {
+        cb_log("central: ble_gap_connect rc=%d — backing off", rc);
+        schedule_reconnect_backoff();
+    } else {
+        arm_connect_watchdog();
     }
 }
 
-/* Write a CCCD value (enable=0x0001 / disable=0x0000) with explicit enable. */
-static esp_err_t cccd_set(uint16_t cccd_handle, bool enable) {
+/* ---- Chain step 2: MTU exchange ------------------------------------- */
+
+static int on_mtu_complete(uint16_t conn_handle, const struct ble_gatt_error *err,
+                           uint16_t mtu, void *arg) {
+    (void)arg;
+    if (conn_handle != S.conn_handle) return 0;
+    if (err && err->status != 0) {
+        cb_log("central: mtu_exchange status=%d", err->status);
+        /* Continue anyway — service discovery works at default MTU. */
+    } else {
+        S.mtus++;
+        cb_log("central: chain 2/9 MTU=%u", mtu);
+    }
+    return 0;
+}
+
+/* ---- Chain step 3-4: service discovery ------------------------------ */
+
+static int on_svc_disc(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       const struct ble_gatt_svc *svc, void *arg) {
+    (void)arg;
+    if (conn_handle != S.conn_handle) return 0;
+
+    if (err && err->status == 0 && svc != NULL) {
+        S.searches++;
+        S.svc_start_handle = svc->start_handle;
+        S.svc_end_handle   = svc->end_handle;
+        cb_log("central: chain 3/9 SEARCH_RES %u..%u",
+               S.svc_start_handle, S.svc_end_handle);
+        return 0;
+    }
+
+    if (err && err->status == BLE_HS_EDONE) {
+        if (S.svc_start_handle == 0) {
+            cb_log("central: chain 4/9 SEARCH_CMPL svc-not-found");
+            (void)ble_gap_terminate(S.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            return 0;
+        }
+        cb_log("central: chain 4/9 SEARCH_CMPL ok");
+        /* Kick off characteristic discovery for the whole service range. */
+        int rc = ble_gattc_disc_all_chrs(S.conn_handle,
+                                         S.svc_start_handle,
+                                         S.svc_end_handle,
+                                         on_chr_disc, NULL);
+        if (rc != 0) cb_log("central: disc_all_chrs rc=%d", rc);
+        return 0;
+    }
+
+    if (err && err->status != 0 && err->status != BLE_HS_EDONE) {
+        cb_log("central: svc_disc status=%d", err->status);
+    }
+    return 0;
+}
+
+/* ---- Chain: characteristic discovery -------------------------------- */
+
+static int on_chr_disc(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       const struct ble_gatt_chr *chr, void *arg) {
+    (void)arg;
+    if (conn_handle != S.conn_handle) return 0;
+
+    if (err && err->status == 0 && chr != NULL) {
+        const ble_uuid_t *u = &chr->uuid.u;
+        uint16_t h = chr->val_handle;
+        if      (ble_uuid_cmp(u, &UUID_CHR_IBI.u)          == 0) S.hdl_ibi          = h;
+        else if (ble_uuid_cmp(u, &UUID_CHR_BATTERY.u)      == 0) S.hdl_battery      = h;
+        else if (ble_uuid_cmp(u, &UUID_CHR_PEER_ROLE.u)    == 0) S.hdl_peer_role    = h;
+        else if (ble_uuid_cmp(u, &UUID_CHR_CONFIG.u)       == 0) S.hdl_config       = h;
+        else if (ble_uuid_cmp(u, &UUID_CHR_CONFIG_WRITE.u) == 0) S.hdl_config_write = h;
+        else if (ble_uuid_cmp(u, &UUID_CHR_RAW.u)          == 0) S.hdl_raw          = h;
+        else if (ble_uuid_cmp(u, &UUID_CHR_DIAG.u)         == 0) S.hdl_diag         = h;
+        return 0;
+    }
+
+    if (err && err->status == BLE_HS_EDONE) {
+        /* Build the dsc_targets table — one entry per notify char that
+         * was actually present. Sort by val_handle so the next_chr_handle
+         * computation works (each target's range ends at the next
+         * target's val_handle, or svc_end_handle for the last). */
+        S.dsc_target_count = 0;
+        struct {
+            uint16_t *vh;
+            uint16_t *ch;
+        } cands[] = {
+            { &S.hdl_ibi,     &S.hdl_ibi_cccd     },
+            { &S.hdl_battery, &S.hdl_battery_cccd },
+            { &S.hdl_config,  &S.hdl_config_cccd  },
+            { &S.hdl_raw,     &S.hdl_raw_cccd     },
+            { &S.hdl_diag,    &S.hdl_diag_cccd    },
+        };
+        const int N = sizeof(cands) / sizeof(cands[0]);
+        for (int i = 0; i < N; i++) {
+            if (*cands[i].vh != 0) {
+                S.dsc_targets[S.dsc_target_count].val_handle  = cands[i].vh;
+                S.dsc_targets[S.dsc_target_count].cccd_handle = cands[i].ch;
+                S.dsc_target_count++;
+            }
+        }
+        /* Insertion sort by val_handle ascending. */
+        for (int i = 1; i < S.dsc_target_count; i++) {
+            dsc_target_t t = S.dsc_targets[i];
+            int j = i - 1;
+            while (j >= 0 && *S.dsc_targets[j].val_handle > *t.val_handle) {
+                S.dsc_targets[j + 1] = S.dsc_targets[j];
+                j--;
+            }
+            S.dsc_targets[j + 1] = t;
+        }
+        /* Compute next_chr_handle for each target (range upper bound). */
+        for (int i = 0; i < S.dsc_target_count; i++) {
+            S.dsc_targets[i].next_chr_handle =
+                (i + 1 < S.dsc_target_count)
+                    ? *S.dsc_targets[i + 1].val_handle
+                    : (uint16_t)(S.svc_end_handle + 1);
+        }
+
+        /* Discover all dscs in the whole service range in one shot. The
+         * dsc cb sorts each 0x2902 it sees into the right char's CCCD slot
+         * by handle range. */
+        if (S.svc_start_handle + 1 > S.svc_end_handle) {
+            /* No room for descriptors — skip ahead. */
+            write_peer_role();
+            return 0;
+        }
+        int rc = ble_gattc_disc_all_dscs(S.conn_handle,
+                                         (uint16_t)(S.svc_start_handle + 1),
+                                         S.svc_end_handle,
+                                         on_dsc_disc, NULL);
+        if (rc != 0) {
+            cb_log("central: disc_all_dscs rc=%d", rc);
+            /* Best-effort fallthrough: try to subscribe without CCCD
+             * handles. cccd_subscribe will skip when handle is 0. */
+            write_peer_role();
+        }
+        return 0;
+    }
+
+    if (err && err->status != 0 && err->status != BLE_HS_EDONE) {
+        cb_log("central: chr_disc status=%d", err->status);
+    }
+    return 0;
+}
+
+/* ---- Chain: descriptor discovery (CCCDs) ---------------------------- */
+
+static int on_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc,
+                       void *arg) {
+    (void)arg; (void)chr_val_handle;
+    if (conn_handle != S.conn_handle) return 0;
+
+    if (err && err->status == 0 && dsc != NULL) {
+        if (ble_uuid_cmp(&dsc->uuid.u, &UUID_CCCD.u) == 0) {
+            /* Find which char this CCCD belongs to. NimBLE's dsc disc
+             * walks ascending; the owning char is the one whose
+             * [val_handle+1, next_chr_handle-1] range contains dsc->handle. */
+            for (int i = 0; i < S.dsc_target_count; i++) {
+                uint16_t lo = (uint16_t)(*S.dsc_targets[i].val_handle + 1);
+                uint16_t hi = (uint16_t)(S.dsc_targets[i].next_chr_handle - 1);
+                if (dsc->handle >= lo && dsc->handle <= hi) {
+                    *S.dsc_targets[i].cccd_handle = dsc->handle;
+                    break;
+                }
+            }
+        }
+        return 0;
+    }
+
+    if (err && err->status == BLE_HS_EDONE) {
+        /* All descriptors discovered. Log what we got, then start the
+         * write/subscribe chain. */
+        cb_log("handles ibi=%u/%u batt=%u/%u role=%u cfg=%u/%u cfgw=%u raw=%u/%u",
+               S.hdl_ibi, S.hdl_ibi_cccd,
+               S.hdl_battery, S.hdl_battery_cccd,
+               S.hdl_peer_role,
+               S.hdl_config, S.hdl_config_cccd, S.hdl_config_write,
+               S.hdl_raw, S.hdl_raw_cccd);
+        write_peer_role();
+        return 0;
+    }
+
+    if (err && err->status != 0 && err->status != BLE_HS_EDONE) {
+        cb_log("central: dsc_disc status=%d", err->status);
+    }
+    return 0;
+}
+
+/* ---- Chain step 5: write peer-role ---------------------------------- */
+
+static void write_peer_role(void) {
+    if (S.hdl_peer_role == 0) {
+        ESP_LOGW(TAG, "no peer-role char; earclip is older firmware");
+        S.state = ST_SUBSCRIBING_IBI;
+        cccd_subscribe_ibi();
+        return;
+    }
+    uint8_t role = (uint8_t)NARBIS_PEER_ROLE_GLASSES;
+    S.state = ST_WRITING_ROLE;
+    int rc = ble_gattc_write_flat(S.conn_handle, S.hdl_peer_role,
+                                  &role, 1, on_role_written, NULL);
+    if (rc != 0) ESP_LOGW(TAG, "write peer_role rc=%d", rc);
+}
+
+static int on_role_written(uint16_t conn_handle, const struct ble_gatt_error *err,
+                           struct ble_gatt_attr *attr, void *arg) {
+    (void)arg; (void)attr;
+    if (conn_handle != S.conn_handle) return 0;
+    if (err && err->status != 0) {
+        cb_log("central: write_role status=%d", err->status);
+    }
+    cb_log("central: chain 5/9 WRITE_ROLE_ACK");
+    S.state = ST_SUBSCRIBING_IBI;
+    cccd_subscribe_ibi();
+    return 0;
+}
+
+/* ---- Chain steps 6-9: CCCD subscribe chain -------------------------- */
+
+static int cccd_write(uint16_t cccd_handle, bool enable,
+                      ble_gatt_attr_fn *cb) {
+    if (cccd_handle == 0) return -1;
     uint8_t val[2] = { (uint8_t)(enable ? 0x01 : 0x00), 0x00 };
-    return esp_ble_gattc_write_char_descr(
-        S.gattc_if, S.conn_id, cccd_handle,
-        sizeof(val), val,
-        ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+    return ble_gattc_write_flat(S.conn_handle, cccd_handle, val, 2, cb, NULL);
 }
 
-/* ---- State-machine helpers for the post-Path-B subscribe chain ------
- *
- * Sequence (per connect):
- *   WRITING_ROLE
- *     → SUBSCRIBING_IBI                    (always; required)
- *     → SUBSCRIBING_CONFIG                 (skip if hdl_config_cccd == 0)
- *     → READING_CONFIG_INITIAL             (one-shot read of hdl_config)
- *     → SUBSCRIBING_BATT                   (skip if hdl_battery_cccd == 0)
- *     → SUBSCRIBING_RAW                    (skip unless raw_enabled && hdl_raw_cccd)
- *     → READY
- *
- * Each forward helper is called with the current state already updated,
- * fires the GATTC operation, and the corresponding EVT advances on
- * completion. */
-static void advance_to_raw_or_ready(void);
-
-/* Transition to ST_READY and emit a log line listing whatever the earclip
- * actually exposed (older earclip firmware may lack config/battery/raw).
- *
- * Idempotent: re-issues `register_for_notify` + CCCD writes for every
- * cached notify handle so this works correctly whether called via the
- * normal subscribe chain (where these are no-ops since the chain
- * already did them) OR via the self-heal path (where the chain stalled
- * mid-way and these are essential to actually start receiving data).
- *
- * Also issues a one-shot CONFIG read so the dashboard's ConfigPanel
- * populates immediately on relay-up. */
-static void enter_ready(void) {
-    S.state = ST_READY;
-    cancel_connect_watchdog();
-
-    /* Bluedroid requires register_for_notify to dispatch incoming
-     * notifies to gattc_cb. Without it, even a CCCD-enabled peer's
-     * notifies are filtered out at the host layer. */
-    if (S.hdl_ibi)     esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_ibi);
-    if (S.hdl_battery) esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_battery);
-    if (S.hdl_config)  esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_config);
-    if (S.hdl_diag)    esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_diag);
-    if (S.raw_enabled && S.hdl_raw) {
-        esp_ble_gattc_register_for_notify(S.gattc_if, S.earclip_mac, S.hdl_raw);
+static void cccd_subscribe_ibi(void) {
+    if (S.hdl_ibi_cccd == 0) {
+        ESP_LOGW(TAG, "no IBI CCCD; skipping to READY");
+        enter_ready();
+        return;
     }
-
-    /* Write 0x0001 to each CCCD to ask the earclip to send notifies.
-     * Idempotent — the peer just acks if already subscribed. */
-    if (S.hdl_ibi_cccd)     cccd_set(S.hdl_ibi_cccd,     true);
-    if (S.hdl_config_cccd)  cccd_set(S.hdl_config_cccd,  true);
-    if (S.hdl_battery_cccd) cccd_set(S.hdl_battery_cccd, true);
-    if (S.hdl_diag_cccd)    cccd_set(S.hdl_diag_cccd,    true);
-    if (S.raw_enabled && S.hdl_raw_cccd) cccd_set(S.hdl_raw_cccd, true);
-
-    /* One-shot CONFIG read so dashboard ConfigPanel populates
-     * immediately. The earclip only notifies CONFIG on changes, so
-     * without this initial read the panel would stay empty until the
-     * user makes the first edit. */
-    if (S.hdl_config) {
-        esp_ble_gattc_read_char(S.gattc_if, S.conn_id, S.hdl_config,
-                                ESP_GATT_AUTH_REQ_NONE);
-    }
-
-    cb_log("central: chain 9/9 READY (IBI%s%s%s)",
-           S.hdl_config_cccd  ? "+cfg"  : "",
-           S.hdl_battery_cccd ? "+batt" : "",
-           (S.raw_enabled && S.hdl_raw_cccd) ? "+raw" : "");
-    emit_state(true);
+    cccd_write(S.hdl_ibi_cccd, true, on_cccd_written);
 }
 
-static void advance_to_raw_or_ready(void) {
+static void advance_to_config_or_batt_or_raw_or_diag_or_ready(void) {
+    if (S.hdl_config_cccd) {
+        S.state = ST_SUBSCRIBING_CONFIG;
+        cccd_write(S.hdl_config_cccd, true, on_cccd_written);
+        return;
+    }
+    advance_to_batt_or_raw_or_diag_or_ready();
+}
+
+/* Initial one-shot CONFIG read so dashboard's ConfigPanel populates
+ * immediately (earclip only notifies CONFIG on changes). */
+static void read_config_initial(void) {
+    S.state = ST_READING_CONFIG_INITIAL;
+    int rc = ble_gattc_read(S.conn_handle, S.hdl_config, on_config_read, NULL);
+    if (rc != 0) {
+        cb_log("central: config initial read rc=%d, advancing", rc);
+        advance_to_batt_or_raw_or_diag_or_ready();
+    }
+}
+
+static int on_config_read(uint16_t conn_handle, const struct ble_gatt_error *err,
+                          struct ble_gatt_attr *attr, void *arg) {
+    (void)arg;
+    if (conn_handle != S.conn_handle) return 0;
+    if (err && err->status == 0 && attr && attr->om && S.config_cb) {
+        /* Pull the mbuf contents into a flat buffer for the cb. */
+        uint16_t len = OS_MBUF_PKTLEN(attr->om);
+        if (len > 0 && len <= 512) {
+            uint8_t *buf = malloc(len);
+            if (buf) {
+                uint16_t copied = 0;
+                if (ble_hs_mbuf_to_flat(attr->om, buf, len, &copied) == 0) {
+                    S.config_cb(buf, copied);
+                    cb_log("central: config read ok (%u B)", copied);
+                }
+                free(buf);
+            }
+        }
+    } else if (err && err->status != 0) {
+        cb_log("central: config read status=%d", err->status);
+    }
+    if (S.state == ST_READING_CONFIG_INITIAL) {
+        advance_to_batt_or_raw_or_diag_or_ready();
+    }
+    return 0;
+}
+
+static void advance_to_batt_or_raw_or_diag_or_ready(void) {
+    if (S.hdl_battery_cccd) {
+        S.state = ST_SUBSCRIBING_BATT;
+        cccd_write(S.hdl_battery_cccd, true, on_cccd_written);
+        return;
+    }
+    advance_to_raw_or_diag_or_ready();
+}
+
+static void advance_to_raw_or_diag_or_ready(void) {
     if (S.raw_enabled && S.hdl_raw_cccd) {
         S.state = ST_SUBSCRIBING_RAW;
-        if (cccd_set(S.hdl_raw_cccd, true) != ESP_OK) {
-            ESP_LOGW(TAG, "raw subscribe write failed; advancing to READY");
+        if (cccd_write(S.hdl_raw_cccd, true, on_cccd_written) != 0) {
+            ESP_LOGW(TAG, "raw subscribe failed; advancing");
+            advance_to_diag_or_ready();
+        }
+        return;
+    }
+    advance_to_diag_or_ready();
+}
+
+static void advance_to_diag_or_ready(void) {
+    if (S.hdl_diag_cccd) {
+        S.state = ST_SUBSCRIBING_DIAG;
+        if (cccd_write(S.hdl_diag_cccd, true, on_cccd_written) != 0) {
+            ESP_LOGW(TAG, "diag subscribe failed; entering READY");
             enter_ready();
         }
         return;
@@ -521,491 +789,144 @@ static void advance_to_raw_or_ready(void) {
     enter_ready();
 }
 
-static void advance_to_batt_or_raw_or_ready(void) {
-    if (S.hdl_battery_cccd) {
-        S.state = ST_SUBSCRIBING_BATT;
-        cccd_subscribe(S.hdl_battery_cccd);
-        return;
+static int on_cccd_written(uint16_t conn_handle, const struct ble_gatt_error *err,
+                           struct ble_gatt_attr *attr, void *arg) {
+    (void)arg; (void)attr;
+    if (conn_handle != S.conn_handle) return 0;
+    if (err && err->status != 0) {
+        cb_log("central: cccd write status=%d (st=%s)",
+               err->status, state_name(S.state));
     }
-    advance_to_raw_or_ready();
+    if (S.state == ST_SUBSCRIBING_IBI) {
+        cb_log("central: chain 6/9 SUB_IBI_ACK");
+        advance_to_config_or_batt_or_raw_or_diag_or_ready();
+    } else if (S.state == ST_SUBSCRIBING_CONFIG) {
+        cb_log("central: chain 7/9 SUB_CFG_ACK");
+        read_config_initial();
+    } else if (S.state == ST_SUBSCRIBING_BATT) {
+        cb_log("central: chain 8/9 SUB_BATT_ACK");
+        advance_to_raw_or_diag_or_ready();
+    } else if (S.state == ST_SUBSCRIBING_RAW) {
+        advance_to_diag_or_ready();
+    } else if (S.state == ST_SUBSCRIBING_DIAG) {
+        enter_ready();
+    }
+    /* Runtime CCCD writes (raw toggle in ST_READY) intentionally fall
+     * through with no state transition. */
+    return 0;
 }
 
-/* The earclip notifies CONFIG only on changes (config_apply / mode_apply),
- * so a fresh subscriber sees nothing until the first edit. Issue a one-
- * shot read so the dashboard sees the current config immediately on
- * relay connect. The READ_CHAR_EVT handler routes the response through
- * the same config_cb the notify path uses, then advances the state. */
-static void read_config_initial(void) {
-    S.state = ST_READING_CONFIG_INITIAL;
-    esp_err_t err = esp_ble_gattc_read_char(
-        S.gattc_if, S.conn_id, S.hdl_config, ESP_GATT_AUTH_REQ_NONE);
-    if (err != ESP_OK) {
-        cb_log("central: config initial read failed rc=%d, advancing", err);
-        advance_to_batt_or_raw_or_ready();
-    }
+/* ---- Chain step 9: READY ------------------------------------------- */
+
+static void enter_ready(void) {
+    S.state = ST_READY;
+    cancel_connect_watchdog();
+    cb_log("central: chain 9/9 READY (IBI%s%s%s%s)",
+           S.hdl_config_cccd  ? "+cfg"  : "",
+           S.hdl_battery_cccd ? "+batt" : "",
+           (S.raw_enabled && S.hdl_raw_cccd) ? "+raw" : "",
+           S.hdl_diag_cccd ? "+diag" : "");
+    emit_state(true);
 }
 
-static void advance_to_config_or_batt_or_raw_or_ready(void) {
-    if (S.hdl_config_cccd) {
-        S.state = ST_SUBSCRIBING_CONFIG;
-        cccd_subscribe(S.hdl_config_cccd);
-        return;
-    }
-    advance_to_batt_or_raw_or_ready();
-}
+/* ---- GAP / GATT event handler --------------------------------------- */
 
-/* ---- Discovery + role write ----------------------------------------- */
+static int gap_event_cb(struct ble_gap_event *event, void *arg) {
+    (void)arg;
+    switch (event->type) {
 
-static const uint8_t NARBIS_CHR_IBI_LE[16]          = NARBIS_CHR_IBI_UUID_BYTES;
-static const uint8_t NARBIS_CHR_BATTERY_LE[16]      = NARBIS_CHR_BATTERY_UUID_BYTES;
-static const uint8_t NARBIS_CHR_PEER_ROLE_LE[16]    = NARBIS_CHR_PEER_ROLE_UUID_BYTES;
-static const uint8_t NARBIS_CHR_CONFIG_LE[16]       = NARBIS_CHR_CONFIG_UUID_BYTES;
-static const uint8_t NARBIS_CHR_CONFIG_WRITE_LE[16] = NARBIS_CHR_CONFIG_WRITE_UUID_BYTES;
-static const uint8_t NARBIS_CHR_RAW_PPG_LE[16]      = NARBIS_CHR_RAW_PPG_UUID_BYTES;
-static const uint8_t NARBIS_CHR_DIAG_LE[16]         = NARBIS_CHR_DIAGNOSTICS_UUID_BYTES;
-
-static bool char_uuid_matches(const esp_bt_uuid_t *u, const uint8_t le16[16]) {
-    if (u->len != ESP_UUID_LEN_128) return false;
-    return memcmp(u->uuid.uuid128, le16, 16) == 0;
-}
-
-/* Walk all chars in the cached service range and stash handles. */
-static void cache_handles_after_discover(void) {
-    uint16_t count = 0;
-    esp_gatt_status_t st = esp_ble_gattc_get_attr_count(
-        S.gattc_if, S.conn_id, ESP_GATT_DB_CHARACTERISTIC,
-        S.svc_start_handle, S.svc_end_handle, 0, &count);
-    if (st != ESP_GATT_OK || count == 0) {
-        ESP_LOGW(TAG, "no chars in service range: st=%d count=%u", st, count);
-        return;
-    }
-    esp_gattc_char_elem_t *chrs = calloc(count, sizeof(*chrs));
-    if (!chrs) return;
-    uint16_t got = count;
-    st = esp_ble_gattc_get_all_char(S.gattc_if, S.conn_id,
-                                    S.svc_start_handle, S.svc_end_handle,
-                                    chrs, &got, 0);
-    if (st != ESP_GATT_OK) {
-        free(chrs);
-        return;
-    }
-    for (uint16_t i = 0; i < got; i++) {
-        const esp_gattc_char_elem_t *c = &chrs[i];
-        if      (char_uuid_matches(&c->uuid, NARBIS_CHR_IBI_LE))          S.hdl_ibi          = c->char_handle;
-        else if (char_uuid_matches(&c->uuid, NARBIS_CHR_BATTERY_LE))      S.hdl_battery      = c->char_handle;
-        else if (char_uuid_matches(&c->uuid, NARBIS_CHR_PEER_ROLE_LE))    S.hdl_peer_role    = c->char_handle;
-        else if (char_uuid_matches(&c->uuid, NARBIS_CHR_CONFIG_LE))       S.hdl_config       = c->char_handle;
-        else if (char_uuid_matches(&c->uuid, NARBIS_CHR_CONFIG_WRITE_LE)) S.hdl_config_write = c->char_handle;
-        else if (char_uuid_matches(&c->uuid, NARBIS_CHR_RAW_PPG_LE))      S.hdl_raw          = c->char_handle;
-        else if (char_uuid_matches(&c->uuid, NARBIS_CHR_DIAG_LE))         S.hdl_diag         = c->char_handle;
-    }
-    free(chrs);
-
-    /* Find the CCCD (0x2902) descriptor following each notify char. */
-    esp_bt_uuid_t cccd = { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = BLE_UUID_CCCD } };
-    if (S.hdl_ibi) {
-        uint16_t dcount = 1;
-        esp_gattc_descr_elem_t d;
-        if (esp_ble_gattc_get_descr_by_char_handle(S.gattc_if, S.conn_id,
-                                                   S.hdl_ibi, cccd,
-                                                   &d, &dcount) == ESP_GATT_OK
-            && dcount > 0) {
-            S.hdl_ibi_cccd = d.handle;
-        }
-    }
-    if (S.hdl_battery) {
-        uint16_t dcount = 1;
-        esp_gattc_descr_elem_t d;
-        if (esp_ble_gattc_get_descr_by_char_handle(S.gattc_if, S.conn_id,
-                                                   S.hdl_battery, cccd,
-                                                   &d, &dcount) == ESP_GATT_OK
-            && dcount > 0) {
-            S.hdl_battery_cccd = d.handle;
-        }
-    }
-    if (S.hdl_config) {
-        uint16_t dcount = 1;
-        esp_gattc_descr_elem_t d;
-        if (esp_ble_gattc_get_descr_by_char_handle(S.gattc_if, S.conn_id,
-                                                   S.hdl_config, cccd,
-                                                   &d, &dcount) == ESP_GATT_OK
-            && dcount > 0) {
-            S.hdl_config_cccd = d.handle;
-        }
-    }
-    if (S.hdl_raw) {
-        uint16_t dcount = 1;
-        esp_gattc_descr_elem_t d;
-        if (esp_ble_gattc_get_descr_by_char_handle(S.gattc_if, S.conn_id,
-                                                   S.hdl_raw, cccd,
-                                                   &d, &dcount) == ESP_GATT_OK
-            && dcount > 0) {
-            S.hdl_raw_cccd = d.handle;
-        }
-    }
-    if (S.hdl_diag) {
-        uint16_t dcount = 1;
-        esp_gattc_descr_elem_t d;
-        if (esp_ble_gattc_get_descr_by_char_handle(S.gattc_if, S.conn_id,
-                                                   S.hdl_diag, cccd,
-                                                   &d, &dcount) == ESP_GATT_OK
-            && dcount > 0) {
-            S.hdl_diag_cccd = d.handle;
-        }
-    }
-    /* Bridge to cb_log so the dashboard can see which CCCDs were found.
-     * If CONFIG / RAW CCCDs are 0 here, those subscribe steps will be
-     * silently skipped — this is the only way to see why. */
-    cb_log("handles ibi=%u/%u batt=%u/%u role=%u cfg=%u/%u cfgw=%u raw=%u/%u",
-           S.hdl_ibi, S.hdl_ibi_cccd,
-           S.hdl_battery, S.hdl_battery_cccd,
-           S.hdl_peer_role,
-           S.hdl_config, S.hdl_config_cccd, S.hdl_config_write,
-           S.hdl_raw, S.hdl_raw_cccd);
-}
-
-static void write_peer_role(void) {
-    if (S.hdl_peer_role == 0) {
-        ESP_LOGW(TAG, "no peer-role char; earclip is older firmware");
-        /* Skip ahead — don't block IBI subscription on a missing char. */
-        S.state = ST_SUBSCRIBING_IBI;
-        if (S.hdl_ibi_cccd) cccd_subscribe(S.hdl_ibi_cccd);
-        return;
-    }
-    uint8_t role = (uint8_t)NARBIS_PEER_ROLE_GLASSES;
-    S.state = ST_WRITING_ROLE;
-    esp_err_t err = esp_ble_gattc_write_char(
-        S.gattc_if, S.conn_id, S.hdl_peer_role,
-        1, &role,
-        ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-    if (err != ESP_OK) ESP_LOGW(TAG, "write peer_role failed: %d", err);
-}
-
-/* ---- GAP event hook (called from main.c's gap_event_handler) -------
- *
- * Bluedroid registers a single GAP callback. The peripheral side already
- * owns it (for advertising lifecycle); main.c invokes this hook for every
- * GAP event so the central can react to scan results / scan-stop. */
-
-void narbis_central_gap_event(esp_gap_ble_cb_event_t event,
-                              esp_ble_gap_cb_param_t *p) {
-    if (p == NULL) return;
-    switch (event) {
-
-    case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
-        /* Scan params accepted; start_scanning was already called separately. */
-        break;
-
-    case ESP_GAP_BLE_SCAN_RESULT_EVT: {
-        const struct ble_scan_result_evt_param *r = &p->scan_rst;
-        if (r->search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) {
-            if (r->search_evt == ESP_GAP_SEARCH_INQ_CMPL_EVT) {
-                /* Scan window elapsed. */
-                if (S.state == ST_SCANNING_GENERAL) {
-                    cb_log("central: scan done, %u adv seen, %u matched narbis",
-                           (unsigned)S.scan_advs_seen,
-                           (unsigned)S.scan_advs_matched);
-                    if (S.best.valid) {
-                        memcpy(S.earclip_mac, S.best.bda, 6);
-                        S.earclip_addr_type = S.best.addr_type;
-                        S.earclip_known = true;
-                        (void)nvs_write_earclip(S.earclip_mac);
-                        cb_log("central: best rssi=%d addr_type=%d, persisted",
-                               S.best.rssi, (int)S.earclip_addr_type);
-                        S.state = ST_CONNECTING;
-                        esp_err_t oerr = esp_ble_gattc_open(S.gattc_if, S.earclip_mac,
-                                                            S.earclip_addr_type, true);
-                        if (oerr != ESP_OK) {
-                            cb_log("central: gattc_open rc=%s — backing off",
-                                   esp_err_to_name(oerr));
-                            schedule_reconnect_backoff();
-                        } else {
-                            arm_connect_watchdog();
-                        }
-                    } else {
-                        schedule_reconnect_backoff();
-                    }
-                } else if (S.state == ST_SCANNING_DIRECTED) {
-                    cb_log("central: directed scan done, %u adv seen, target not found",
-                           (unsigned)S.scan_advs_seen);
-                    schedule_reconnect_backoff();
-                }
-                S.scan_advs_seen = 0;
-                S.scan_advs_matched = 0;
-            }
-            break;
-        }
-
-        /* Inquiry result hit — count it for diagnostics. */
+    case BLE_GAP_EVENT_DISC: {
         S.scan_advs_seen++;
-
+        const struct ble_gap_disc_desc *r = &event->disc;
         if (S.state == ST_SCANNING_DIRECTED) {
-            if (S.earclip_known
-                && memcmp(r->bda, S.earclip_mac, 6) == 0) {
-                /* Refresh on every hit: NVS persists only the MAC, so on a
-                 * cold boot we don't yet know the address type until we see
-                 * the first adv from the saved peer. */
-                S.earclip_addr_type = r->ble_addr_type;
-                esp_ble_gap_stop_scanning();
-                S.state = ST_CONNECTING;
+            if (S.earclip_known && memcmp(r->addr.val, S.earclip_mac, 6) == 0) {
+                S.earclip_addr_type = r->addr.type;
+                (void)ble_gap_disc_cancel();
                 S.last_seen_us = esp_timer_get_time();
-                esp_err_t oerr = esp_ble_gattc_open(S.gattc_if, S.earclip_mac,
-                                                    S.earclip_addr_type, true);
-                if (oerr != ESP_OK) {
-                    cb_log("central: gattc_open rc=%s — backing off",
-                           esp_err_to_name(oerr));
-                    schedule_reconnect_backoff();
-                } else {
-                    arm_connect_watchdog();
-                }
+                initiate_connect();
             }
         } else if (S.state == ST_SCANNING_GENERAL) {
-            if (adv_contains_narbis_svc(r->ble_adv, r->adv_data_len + r->scan_rsp_len)) {
+            struct ble_hs_adv_fields fields;
+            if (ble_hs_adv_parse_fields(&fields, r->data, r->length_data) == 0 &&
+                adv_contains_narbis_svc(&fields)) {
                 S.scan_advs_matched++;
-                /* Log the first match per scan window so users can see
-                 * proof-of-life without spamming with every adv. */
                 if (S.scan_advs_matched == 1) {
                     cb_log("central: matched narbis adv %02x:%02x:%02x:%02x:%02x:%02x rssi=%d",
-                           r->bda[0], r->bda[1], r->bda[2],
-                           r->bda[3], r->bda[4], r->bda[5], r->rssi);
+                           r->addr.val[0], r->addr.val[1], r->addr.val[2],
+                           r->addr.val[3], r->addr.val[4], r->addr.val[5], r->rssi);
                 }
                 if (!S.best.valid || r->rssi > S.best.rssi) {
                     S.best.valid = true;
                     S.best.rssi = r->rssi;
-                    S.best.addr_type = r->ble_addr_type;
-                    memcpy(S.best.bda, r->bda, 6);
+                    S.best.addr_type = r->addr.type;
+                    memcpy(S.best.bda, r->addr.val, 6);
                 }
             }
         }
-        break;
+        return 0;
     }
 
-    case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
-    case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT:
-    default:
-        break;
-    }
-}
-
-/* ---- GATTC callback ------------------------------------------------- */
-
-static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
-                     esp_ble_gattc_cb_param_t *p) {
-    switch (event) {
-
-    case ESP_GATTC_REG_EVT:
-        if (p->reg.status == ESP_GATT_OK) {
-            S.gattc_if = gattc_if;
-            ESP_LOGI(TAG, "gattc registered, if=%d", gattc_if);
-        } else {
-            ESP_LOGE(TAG, "gattc reg failed: %d", p->reg.status);
-        }
-        break;
-
-    case ESP_GATTC_CONNECT_EVT: {
-        /* PR #11: arm the watchdog HERE unconditionally as well as in the
-         * scan handler — covers the bonded-peer auto-reconnect path where
-         * Bluedroid produces CONNECT_EVT without us calling gattc_open().
-         * Harmless if scan handler already armed; esp_timer_start_once
-         * resets the timer. */
-        central_state_t prev_state = S.state;
-        if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
-        S.conn_id = p->connect.conn_id;
-        S.last_seen_us = esp_timer_get_time();
-        /* PR #14: if we were already at READY before this CONNECT_EVT,
-         * Bluedroid silently re-cycled the link (no DISCONNECT_EVT to
-         * our cb). Reset the emit_state dedup so the next emit_state(true)
-         * actually fires; otherwise the dashboard badge stays stuck. */
-        if (prev_state == ST_READY) {
-            emit_state(false);
-        }
-        S.state = ST_DISCOVERING;
-        S.connects++;
-        S.peer_connected = true;
-        arm_connect_watchdog();
-        cb_log("central: chain 1/9 CONNECT conn_id=%u (was %s)",
-               (unsigned)S.conn_id, state_name(prev_state));
-        esp_err_t mrc = esp_ble_gattc_send_mtu_req(gattc_if, S.conn_id);
-        if (mrc != ESP_OK) {
-            cb_log("central: send_mtu_req rc=%s", esp_err_to_name(mrc));
-        }
-        /* Observed (2026-05-14, log on PR #19): CFG_MTU_EVT does not
-         * fire on this hardware (chain c=1 mtu=0 srch=0 across the wedge
-         * window, then watchdog at 15 s). Kick off search_service now
-         * rather than gating on the dropped MTU event. Search runs fine
-         * at default MTU=23; subsequent larger reads still benefit from
-         * MTU=247 once it's exchanged at the LL layer. */
-        {
-            esp_bt_uuid_t svc = { .len = ESP_UUID_LEN_128 };
-            memcpy(svc.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
-            esp_err_t src = esp_ble_gattc_search_service(gattc_if, S.conn_id, &svc);
-            if (src != ESP_OK) {
-                cb_log("central: search_service rc=%s", esp_err_to_name(src));
-            }
-        }
-        break;
-    }
-
-    case ESP_GATTC_OPEN_EVT:
-        if (p->open.status != ESP_GATT_OK) {
-            cb_log("central: open failed status=%d", p->open.status);
-            /* Status 0x91 ESP_GATT_ALREADY_OPEN = Bluedroid still
-             * tracks a previous connection (or pending open) to this
-             * MAC. Backing off and retrying loops forever — the stale
-             * state needs a force-disconnect to clear. The DISCONNECT
-             * event will then fire and auto-restart the scan; we add
-             * a short backoff as a safety net in case it doesn't. */
-            if (p->open.status == ESP_GATT_ALREADY_OPEN) {
-                cb_log("central: stale conn — forcing gap_disconnect");
-                (void)esp_ble_gap_disconnect(S.earclip_mac);
-                S.state = ST_BACKOFF;
-                if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
-                esp_timer_start_once(S.backoff_timer, 2 * 1000 * 1000ULL);
+    case BLE_GAP_EVENT_DISC_COMPLETE:
+        if (S.state == ST_SCANNING_GENERAL) {
+            cb_log("central: scan done, %u adv seen, %u matched narbis",
+                   (unsigned)S.scan_advs_seen, (unsigned)S.scan_advs_matched);
+            if (S.best.valid) {
+                memcpy(S.earclip_mac, S.best.bda, 6);
+                S.earclip_addr_type = S.best.addr_type;
+                S.earclip_known = true;
+                (void)nvs_write_earclip(S.earclip_mac);
+                cb_log("central: best rssi=%d addr_type=%d, persisted",
+                       S.best.rssi, (int)S.earclip_addr_type);
+                initiate_connect();
             } else {
                 schedule_reconnect_backoff();
             }
+        } else if (S.state == ST_SCANNING_DIRECTED) {
+            cb_log("central: directed scan done, %u adv seen, target not found",
+                   (unsigned)S.scan_advs_seen);
+            schedule_reconnect_backoff();
         }
-        break;
+        S.scan_advs_seen = 0;
+        S.scan_advs_matched = 0;
+        return 0;
 
-    case ESP_GATTC_CFG_MTU_EVT:
-        S.mtus++;
-        cb_log("central: chain 2/9 MTU=%u (info-only)", p->cfg_mtu.mtu);
-        /* search_service already kicked off in CONNECT_EVT — see comment
-         * there. This event is informational; the mtus counter tells us
-         * whether the peer's MTU completion got reported back. */
-        break;
-
-    case ESP_GATTC_SEARCH_RES_EVT:
-        S.searches++;
-        S.svc_start_handle = p->search_res.start_handle;
-        S.svc_end_handle   = p->search_res.end_handle;
-        cb_log("central: chain 3/9 SEARCH_RES %u..%u",
-               S.svc_start_handle, S.svc_end_handle);
-        break;
-
-    case ESP_GATTC_SEARCH_CMPL_EVT:
-        if (S.svc_start_handle == 0) {
-            cb_log("central: chain 4/9 SEARCH_CMPL svc-not-found");
-            esp_ble_gattc_close(gattc_if, S.conn_id);
-            break;
-        }
-        cb_log("central: chain 4/9 SEARCH_CMPL ok");
-        cache_handles_after_discover();
-        write_peer_role();
-        break;
-
-    case ESP_GATTC_WRITE_CHAR_EVT:
-        /* Only the connect-time peer-role write should advance the state
-         * machine. Runtime config-write completions (CONFIG_WRITE while
-         * in ST_READY) reach this event too — guard so they don't reset. */
-        if (S.state == ST_WRITING_ROLE) {
-            cb_log("central: chain 5/9 WRITE_ROLE_ACK");
-            S.state = ST_SUBSCRIBING_IBI;
-            if (S.hdl_ibi_cccd) cccd_subscribe(S.hdl_ibi_cccd);
-            else { ESP_LOGW(TAG, "no IBI CCCD; skipping"); enter_ready(); }
-        }
-        break;
-
-    case ESP_GATTC_WRITE_DESCR_EVT:
-        if (S.state == ST_SUBSCRIBING_IBI) {
-            cb_log("central: chain 6/9 SUB_IBI_ACK");
-            advance_to_config_or_batt_or_raw_or_ready();
-        } else if (S.state == ST_SUBSCRIBING_CONFIG) {
-            cb_log("central: chain 7/9 SUB_CFG_ACK");
-            read_config_initial();
-        } else if (S.state == ST_SUBSCRIBING_BATT) {
-            cb_log("central: chain 8/9 SUB_BATT_ACK");
-            advance_to_raw_or_ready();
-        } else if (S.state == ST_SUBSCRIBING_RAW) {
-            enter_ready();
-        }
-        /* Runtime CCCD writes (e.g. raw toggle in ST_READY) intentionally
-         * fall through — no state transition. */
-        break;
-
-    case ESP_GATTC_READ_CHAR_EVT: {
-        const struct gattc_read_char_evt_param *r = &p->read;
-        /* Always dispatch CONFIG reads to the callback — could come
-         * from the boot-time chain (state=READING_CONFIG_INITIAL) OR
-         * from enter_ready's idempotent read (state=READY). Without
-         * this the config blob silently drops on the relay path. */
-        if (r->handle == S.hdl_config) {
-            if (r->status == ESP_GATT_OK && S.config_cb) {
-                S.config_cb(r->value, r->value_len);
-                cb_log("central: config read ok (%u B)", r->value_len);
-            } else if (r->status != ESP_GATT_OK) {
-                cb_log("central: config read status=%d", r->status);
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            central_state_t prev_state = S.state;
+            if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
+            S.conn_handle = event->connect.conn_handle;
+            S.last_seen_us = esp_timer_get_time();
+            if (prev_state == ST_READY) {
+                /* Silent re-cycle without DISCONNECT — reset dedup. */
+                emit_state(false);
             }
-            /* Only advance the state machine if we're actually in the
-             * boot-time chain. In ST_READY this is just a refresh. */
-            if (S.state == ST_READING_CONFIG_INITIAL) {
-                advance_to_batt_or_raw_or_ready();
-            }
-        }
-        break;
-    }
-
-    case ESP_GATTC_NOTIFY_EVT: {
-        const struct gattc_notify_evt_param *n = &p->notify;
-        if (n->handle == S.hdl_ibi
-            && n->value_len >= sizeof(narbis_ibi_payload_t)) {
-            narbis_ibi_payload_t pl;
-            memcpy(&pl, n->value, sizeof(pl));
-            if (S.ibi_cb) S.ibi_cb(pl.ibi_ms, pl.confidence_x100, pl.flags);
-            S.notify_ibi_count++;
-        } else if (n->handle == S.hdl_battery
-                   && n->value_len >= sizeof(narbis_battery_payload_t)) {
-            narbis_battery_payload_t pl;
-            memcpy(&pl, n->value, sizeof(pl));
-            if (S.batt_cb) S.batt_cb(pl.soc_pct, pl.mv, pl.charging);
-            S.notify_batt_count++;
-        } else if (n->handle == S.hdl_config && S.config_cb) {
-            S.config_cb(n->value, n->value_len);
-            S.notify_config_count++;
-        } else if (n->handle == S.hdl_raw && S.raw_cb) {
-            S.raw_cb(n->value, n->value_len);
-            S.notify_raw_count++;
-        } else if (n->handle == S.hdl_diag && S.diag_cb) {
-            S.diag_cb(n->value, n->value_len);
-            S.notify_diag_count++;
+            S.state = ST_DISCOVERING;
+            S.connects++;
+            S.peer_connected = true;
+            arm_connect_watchdog();
+            cb_log("central: chain 1/9 CONNECT conn=%u (was %s)",
+                   (unsigned)S.conn_handle, state_name(prev_state));
+            /* Kick off MTU exchange and service discovery. MTU is
+             * informational; discovery starts immediately and runs at
+             * default MTU until the exchange completes. */
+            (void)ble_gattc_exchange_mtu(S.conn_handle, on_mtu_complete, NULL);
+            int rc = ble_gattc_disc_svc_by_uuid(S.conn_handle, &UUID_SVC.u,
+                                                on_svc_disc, NULL);
+            if (rc != 0) cb_log("central: disc_svc rc=%d", rc);
         } else {
-            S.notify_other_count++;
+            cb_log("central: connect failed status=%d", event->connect.status);
+            schedule_reconnect_backoff();
         }
-        S.last_seen_us = esp_timer_get_time();
-        /* Self-heal: if we're already receiving notifies but the state
-         * machine never advanced to READY (e.g. WRITE_DESCR_EVT for the
-         * last subscribe was lost under load), the subscribe chain
-         * obviously succeeded — force the transition so emit_state(true)
-         * fires and the dashboard badge updates. */
-        if (S.state != ST_READY &&
-            (S.state == ST_SUBSCRIBING_IBI ||
-             S.state == ST_SUBSCRIBING_CONFIG ||
-             S.state == ST_READING_CONFIG_INITIAL ||
-             S.state == ST_SUBSCRIBING_BATT ||
-             S.state == ST_SUBSCRIBING_RAW)) {
-            cb_log("central: notify mid-subscribe (st=%d) — force READY", (int)S.state);
-            enter_ready();
-        }
-        break;
-    }
+        return 0;
 
-    case ESP_GATTC_DISCONNECT_EVT:
+    case BLE_GAP_EVENT_DISCONNECT:
         S.disconnects++;
         S.peer_connected = false;
-        cb_log("central: disconnected reason=%d", p->disconnect.reason);
+        cb_log("central: disconnected reason=0x%04x",
+               event->disconnect.reason);
         cancel_connect_watchdog();
         emit_state(false);
-        /* Unregister all per-char notify registrations so they don't
-         * pile up in Bluedroid's internal table (default cap of 5
-         * entries via CONFIG_BT_GATTC_NOTIF_REG_MAX). Without this,
-         * after a few reconnects the table fills, new register_for_notify
-         * calls fail, and downstream discovery/notify dispatch breaks. */
-        if (S.hdl_ibi)     esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_ibi);
-        if (S.hdl_battery) esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_battery);
-        if (S.hdl_config)  esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_config);
-        if (S.hdl_raw)     esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_raw);
-        if (S.hdl_diag)    esp_ble_gattc_unregister_for_notify(S.gattc_if, S.earclip_mac, S.hdl_diag);
-        S.conn_id = 0;
+        S.conn_handle = CONN_HANDLE_NONE;
         S.svc_start_handle = S.svc_end_handle = 0;
         S.hdl_ibi = S.hdl_ibi_cccd = 0;
         S.hdl_battery = S.hdl_battery_cccd = 0;
@@ -1016,21 +937,89 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.notify_ibi_count = S.notify_config_count = 0;
         S.notify_batt_count = S.notify_raw_count = 0;
         S.notify_diag_count = S.notify_other_count = 0;
-        /* Avoid re-issuing scan if forget()/start() already kicked one
-         * off. Without this guard, a forced disconnect during a fresh
-         * scan would restart that scan and lose progress. Also skip
-         * entirely when paused (HR-source switched to H10) — the
-         * disconnect was intentional and we shouldn't reconnect. */
+        S.dsc_target_count = 0;
         if (S.paused) {
             S.state = ST_IDLE;
         } else if (S.state != ST_SCANNING_DIRECTED && S.state != ST_SCANNING_GENERAL) {
             if (S.earclip_known) start_scan_directed();
             else                 start_scan_general();
         }
-        break;
+        return 0;
+
+    case BLE_GAP_EVENT_MTU:
+        /* NimBLE delivers MTU as both a per-call cb (on_mtu_complete) and
+         * a gap_event. Either path increments S.mtus / logs chain 2/9. We
+         * only count the per-call cb path to avoid double-counting. */
+        return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        const struct ble_gap_event_notify_rx *n = &event->notify_rx;
+        if (n->conn_handle != S.conn_handle || n->om == NULL) return 0;
+        uint16_t len = OS_MBUF_PKTLEN(n->om);
+        uint8_t buf[256];
+        if (len > sizeof(buf)) return 0;
+        uint16_t copied = 0;
+        if (ble_hs_mbuf_to_flat(n->om, buf, sizeof(buf), &copied) != 0) {
+            return 0;
+        }
+
+        if (n->attr_handle == S.hdl_ibi && copied >= sizeof(narbis_ibi_payload_t)) {
+            narbis_ibi_payload_t pl;
+            memcpy(&pl, buf, sizeof(pl));
+            if (S.ibi_cb) S.ibi_cb(pl.ibi_ms, pl.confidence_x100, pl.flags);
+            S.notify_ibi_count++;
+        } else if (n->attr_handle == S.hdl_battery &&
+                   copied >= sizeof(narbis_battery_payload_t)) {
+            narbis_battery_payload_t pl;
+            memcpy(&pl, buf, sizeof(pl));
+            if (S.batt_cb) S.batt_cb(pl.soc_pct, pl.mv, pl.charging);
+            S.notify_batt_count++;
+        } else if (n->attr_handle == S.hdl_config && S.config_cb) {
+            S.config_cb(buf, copied);
+            S.notify_config_count++;
+        } else if (n->attr_handle == S.hdl_raw && S.raw_cb) {
+            S.raw_cb(buf, copied);
+            S.notify_raw_count++;
+        } else if (n->attr_handle == S.hdl_diag && S.diag_cb) {
+            S.diag_cb(buf, copied);
+            S.notify_diag_count++;
+        } else {
+            S.notify_other_count++;
+        }
+        S.last_seen_us = esp_timer_get_time();
+
+        /* Self-heal: notifies before READY means the subscribe chain
+         * succeeded but a CCCD-write ack was lost. Force the transition. */
+        if (S.state != ST_READY &&
+            (S.state == ST_SUBSCRIBING_IBI    ||
+             S.state == ST_SUBSCRIBING_CONFIG ||
+             S.state == ST_READING_CONFIG_INITIAL ||
+             S.state == ST_SUBSCRIBING_BATT   ||
+             S.state == ST_SUBSCRIBING_RAW    ||
+             S.state == ST_SUBSCRIBING_DIAG)) {
+            cb_log("central: notify mid-subscribe (st=%s) — force READY",
+                   state_name(S.state));
+            enter_ready();
+        }
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        /* Earclip drives BATCHED / LOW_LATENCY profile from its side. Log
+         * the resulting params for diagnostic visibility. */
+        if (S.conn_handle != CONN_HANDLE_NONE) {
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(S.conn_handle, &desc) == 0) {
+                cb_log("central: conn_update itvl=%u lat=%u tout=%u",
+                       (unsigned)desc.conn_itvl,
+                       (unsigned)desc.conn_latency,
+                       (unsigned)desc.supervision_timeout);
+            }
+        }
+        return 0;
 
     default:
-        break;
+        return 0;
     }
 }
 
@@ -1041,41 +1030,28 @@ esp_err_t narbis_central_init(narbis_central_ibi_cb_t     ibi_cb,
     memset(&S, 0, sizeof(S));
     S.ibi_cb  = ibi_cb;
     S.batt_cb = batt_cb;
-    S.gattc_if = ESP_GATT_IF_NONE;
-    /* Default raw-PPG relay ON so the central subscribes during the
-     * boot-time connect chain (rather than waiting for the dashboard's
-     * 0xC4=1 to arrive after READY — by then the chain has finished
-     * and the toggle would only apply on next reconnect). The dashboard
-     * can still turn it off mid-session via 0xC4=0. */
+    S.conn_handle = CONN_HANDLE_NONE;
     S.raw_enabled = true;
-
-    esp_err_t err;
-    /* GAP callback is owned by main.c's gap_event_handler — it forwards
-     * every event to narbis_central_gap_event(). Registering a second
-     * callback here would silently replace the peripheral's. */
-    if ((err = esp_ble_gattc_register_callback(gattc_cb)) != ESP_OK) return err;
-    if ((err = esp_ble_gattc_app_register(NARBIS_GATTC_APP_ID)) != ESP_OK) return err;
 
     const esp_timer_create_args_t targs = {
         .callback = backoff_timer_cb,
         .name = "narbis_central_backoff",
     };
-    if ((err = esp_timer_create(&targs, &S.backoff_timer)) != ESP_OK) return err;
+    esp_err_t err = esp_timer_create(&targs, &S.backoff_timer);
+    if (err != ESP_OK) return err;
 
     const esp_timer_create_args_t wargs = {
         .callback = connect_watchdog_cb,
         .name = "narbis_central_watchdog",
     };
-    if ((err = esp_timer_create(&wargs, &S.connect_watchdog)) != ESP_OK) return err;
+    err = esp_timer_create(&wargs, &S.connect_watchdog);
+    if (err != ESP_OK) return err;
 
-    ESP_LOGI(TAG, "central init ok");
+    ESP_LOGI(TAG, "central init ok (NimBLE)");
     return ESP_OK;
 }
 
 esp_err_t narbis_central_start(void) {
-    /* Clear paused state in case we're resuming after a stop() — the
-     * dashboard flipped HR source back to earclip. Idempotent if already
-     * unpaused. */
     if (S.paused) {
         ESP_LOGI(TAG, "central: resuming (was paused)");
         S.paused = false;
@@ -1083,6 +1059,11 @@ esp_err_t narbis_central_start(void) {
     uint8_t mac[6];
     if (nvs_read_earclip(mac) == ESP_OK) {
         memcpy(S.earclip_mac, mac, 6);
+        /* Address type unknown until we see the first adv from this peer;
+         * BLE_ADDR_PUBLIC is the sane default for ESP-IDF v5 NimBLE which
+         * burns a public BD_ADDR into eFuse on production silicon. The
+         * actual addr_type is captured from the scan match below. */
+        S.earclip_addr_type = BLE_ADDR_PUBLIC;
         S.earclip_known = true;
         ESP_LOGI(TAG, "central: NVS earclip %02x:%02x:%02x:%02x:%02x:%02x",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -1101,21 +1082,15 @@ esp_err_t narbis_central_stop(void) {
     cancel_connect_watchdog();
     S.peer_connected = false;
     emit_state(false);
-    /* Close any active connection; the DISCONNECT_EVT handler sees
-     * S.paused=true and skips the auto-restart-scan. */
-    if (S.conn_id) {
-        esp_ble_gattc_close(S.gattc_if, S.conn_id);
+    if (S.conn_handle != CONN_HANDLE_NONE) {
+        (void)ble_gap_terminate(S.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
-    /* Cancel any in-flight scan. */
-    if (S.state == ST_SCANNING_DIRECTED || S.state == ST_SCANNING_GENERAL) {
-        esp_ble_gap_stop_scanning();
-    }
-    /* Drop the backoff timer so a pending tick doesn't relaunch a scan. */
+    /* Cancel any in-flight scan. ble_gap_disc_cancel is a no-op if no
+     * scan is active. */
+    (void)ble_gap_disc_cancel();
     if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
     S.scan_attempts = 0;
-    /* Leave earclip_known + earclip_mac intact so a subsequent
-     * narbis_central_start() can resume directed scan to the same earclip
-     * without re-pairing. */
+    /* Preserve earclip_known + earclip_mac for resume on start(). */
     return ESP_OK;
 }
 
@@ -1124,19 +1099,10 @@ esp_err_t narbis_central_forget(void) {
     cancel_connect_watchdog();
     S.peer_connected = false;
     emit_state(false);
-    if (S.conn_id) {
-        esp_ble_gattc_close(S.gattc_if, S.conn_id);
+    if (S.conn_handle != CONN_HANDLE_NONE) {
+        (void)ble_gap_terminate(S.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
-    /* Defensive: even if our tracked conn_id is 0, Bluedroid may still
-     * have a stale connection to the previous MAC (e.g. earclip
-     * power-cycled mid-session). Force-disconnect on the stored MAC
-     * before wiping it so the next open() doesn't return ALREADY_OPEN. */
-    if (S.earclip_known) {
-        (void)esp_ble_gap_disconnect(S.earclip_mac);
-    }
-    if (S.state == ST_SCANNING_DIRECTED || S.state == ST_SCANNING_GENERAL) {
-        esp_ble_gap_stop_scanning();
-    }
+    (void)ble_gap_disc_cancel();
     if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
     S.earclip_known = false;
     memset(S.earclip_mac, 0, 6);
@@ -1145,18 +1111,10 @@ esp_err_t narbis_central_forget(void) {
 }
 
 bool narbis_central_is_connected(void) {
-    /* Bluedroid link state, not app state machine. The dashboard's
-     * 0xF6 relay-link badge wants the same notion of "connected" that
-     * the earclip's LED uses (BLE link established), regardless of
-     * whether our state machine reached ST_READY. Returning state
-     * == ST_READY here caused the dashboard to stick at "scanning
-     * earclip" any time Bluedroid silently re-cycled the link, even
-     * while the earclip was happily streaming. The chain counters in
-     * the diag dump still report the app-state progress separately. */
+    /* Link state, not app state machine — matches the 0xF6 relay-link
+     * badge semantic the dashboard expects. */
     return S.peer_connected;
 }
-
-/* ---- Path B Phase 1/2: config + raw relay setters ------------------- */
 
 void narbis_central_set_config_cb(narbis_central_config_cb_t cb) {
     S.config_cb = cb;
@@ -1172,15 +1130,14 @@ void narbis_central_set_diag_cb(narbis_central_diag_cb_t cb) {
 
 esp_err_t narbis_central_set_raw_enabled(bool enabled) {
     S.raw_enabled = enabled;
-    /* Latch only if not in a state where we can write the CCCD now. */
     if (S.state != ST_READY || S.hdl_raw_cccd == 0) {
         cb_log("central: raw subscribe %s (latched, will apply on connect)",
                enabled ? "on" : "off");
         return ESP_OK;
     }
-    esp_err_t err = cccd_set(S.hdl_raw_cccd, enabled);
-    cb_log("central: raw subscribe %s rc=%d", enabled ? "on" : "off", err);
-    return err;
+    int rc = cccd_write(S.hdl_raw_cccd, enabled, on_cccd_written);
+    cb_log("central: raw subscribe %s rc=%d", enabled ? "on" : "off", rc);
+    return (rc == 0) ? ESP_OK : ESP_FAIL;
 }
 
 static const char *state_name(central_state_t s) {
@@ -1196,6 +1153,7 @@ static const char *state_name(central_state_t s) {
     case ST_READING_CONFIG_INITIAL: return "READ_CFG";
     case ST_SUBSCRIBING_BATT:       return "SUB_BATT";
     case ST_SUBSCRIBING_RAW:        return "SUB_RAW";
+    case ST_SUBSCRIBING_DIAG:       return "SUB_DIAG";
     case ST_READY:                  return "READY";
     case ST_BACKOFF:                return "BACKOFF";
     }
@@ -1205,8 +1163,6 @@ static const char *state_name(central_state_t s) {
 void narbis_central_emit_diag(void) {
     cb_log("relay state=%s ready=%d", state_name(S.state),
            narbis_central_is_connected() ? 1 : 0);
-    /* Split handles across two lines so neither overruns the 64-byte
-     * ble_log buffer (which truncates the trailing CCCD value). */
     cb_log("hdl ibi=%u/%u batt=%u/%u role=%u",
            S.hdl_ibi, S.hdl_ibi_cccd,
            S.hdl_battery, S.hdl_battery_cccd,
@@ -1215,18 +1171,10 @@ void narbis_central_emit_diag(void) {
            S.hdl_config, S.hdl_config_cccd, S.hdl_config_write,
            S.hdl_raw, S.hdl_raw_cccd,
            S.hdl_diag, S.hdl_diag_cccd);
-    /* Notify counters — if state=READY but all of these are 0, the
-     * earclip isn't sending OR Bluedroid isn't dispatching. Non-zero
-     * means data is actually flowing. */
     cb_log("rx ibi=%u cfg=%u batt=%u raw=%u diag=%u other=%u",
            (unsigned)S.notify_ibi_count, (unsigned)S.notify_config_count,
            (unsigned)S.notify_batt_count, (unsigned)S.notify_raw_count,
            (unsigned)S.notify_diag_count, (unsigned)S.notify_other_count);
-    /* Chain progress counters — pairs with the relay state= line above to
-     * localize wedges that happen before the dashboard subscribes (the
-     * one-shot CONNECT/MTU/SEARCH events otherwise leave no BLE-visible
-     * trace). wd_ok=0 means S.connect_watchdog is NULL — the timer-based
-     * watchdog is disabled (likely esp_timer_create failed at init). */
     cb_log("chain c=%u d=%u mtu=%u srch=%u wdc=%u wda=%u wdf=%u wd_ok=%d",
            (unsigned)S.connects, (unsigned)S.disconnects,
            (unsigned)S.mtus, (unsigned)S.searches,
@@ -1234,15 +1182,21 @@ void narbis_central_emit_diag(void) {
            S.connect_watchdog ? 1 : 0);
 }
 
+static int on_config_write_done(uint16_t conn_handle, const struct ble_gatt_error *err,
+                                struct ble_gatt_attr *attr, void *arg) {
+    (void)conn_handle; (void)attr; (void)arg;
+    cb_log("central: config write rc=%d", err ? err->status : 0);
+    return 0;
+}
+
 esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len) {
     if (S.state != ST_READY || S.hdl_config_write == 0) {
         return ESP_ERR_INVALID_STATE;
     }
     if (bytes == NULL || len == 0) return ESP_ERR_INVALID_ARG;
-    esp_err_t err = esp_ble_gattc_write_char(
-        S.gattc_if, S.conn_id, S.hdl_config_write,
-        (uint16_t)len, (uint8_t *)bytes,
-        ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-    cb_log("central: config write rc=%d (%u B)", err, (unsigned)len);
-    return err;
+    int rc = ble_gattc_write_flat(S.conn_handle, S.hdl_config_write,
+                                  bytes, (uint16_t)len,
+                                  on_config_write_done, NULL);
+    cb_log("central: config write dispatch rc=%d (%u B)", rc, (unsigned)len);
+    return (rc == 0) ? ESP_OK : ESP_FAIL;
 }
