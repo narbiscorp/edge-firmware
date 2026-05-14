@@ -1,19 +1,64 @@
 # This file was generated using idf.py save-defconfig. It can be edited manually.
 # Espressif IoT Development Framework (ESP-IDF) Project Minimal Configuration
 #
+
+# ============================================================
+# BLE host stack: NimBLE
+# ============================================================
+# Migrated from Bluedroid in commit "glasses: migrate BLE stack
+# Bluedroid -> NimBLE". The Bluedroid host on ESP-IDF v5 silently
+# dropped CFG_MTU_EVT / SEARCH_RES_EVT under dual-role (central +
+# peripheral) contention; see NIMBLE_MIGRATION_HANDOFF.md for the
+# full diagnosis (earclip log proved the event was on the wire but
+# never reached gattc_cb). NimBLE has a different host architecture
+# (per-call callbacks, no global single-task event filter) and is the
+# stack Espressif recommends for ESP-IDF v5+. The earclip already
+# runs NimBLE in the inverse dual-role pattern (1 peripheral, N
+# centrals) without issue.
 CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_CONTROLLER_ENABLED=y
+
+# Roles: glasses needs central (to earclip) AND peripheral (to dashboard).
+# Broadcaster off — we never use connection-less adv beyond standard adv.
+# Observer on so scan callbacks resolve service-UUID filtering cleanly.
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+
+# Max simultaneous connections: 1 earclip (central) + 1 dashboard
+# (peripheral) = 2. The earclip uses 3 for its own multi-central
+# pattern; we don't need that.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
+CONFIG_BT_LE_MAX_CONNECTIONS=2
+
+# 247 = 244 byte ATT payload + 3 byte ATT header. Matches earclip;
+# fits a 29-sample RAW_PPG batch (4 + 29*8 = 236 B) in one notify.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
+
+# SMP / bonding OFF. Design is MAC-based pairing (NVS-saved earclip
+# MAC, plain GATT, no encryption). Bluedroid required gymnastics
+# (PRs #12-#19) to keep its SMP NVS from auto-reconnecting and
+# wedging the GATTC chain; NimBLE simply doesn't compile in the SMP
+# code path when both flags are off, eliminating that surface.
+CONFIG_BT_NIMBLE_SM_LEGACY=n
+CONFIG_BT_NIMBLE_SM_SC=n
+
+# Don't persist any NimBLE host state to NVS. Our app NVS namespace
+# ("narbis_pair") owns the earclip-MAC blob; the BLE stack doesn't
+# need to know about pairing across reboots.
+CONFIG_BT_NIMBLE_NVS_PERSIST=n
+
+# Modem sleep between connection events. Matches earclip; saves
+# noticeable power during idle BATCHED intervals.
+CONFIG_BT_LE_SLEEP_ENABLE=y
+
 CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
-
-# Disable persistent SMP bonding. The central uses ESP_GATT_AUTH_REQ_NONE
-# (no encryption) and the design is MAC-based pairing (NVS-saved earclip
-# MAC, plain GATT). Bonded peers in Bluedroid's SMP NVS would otherwise
-# trigger auto-reconnect on every boot — Bluedroid completes MTU /
-# discovery / subscribe internally using cached handles and never calls
-# our gattc_cb, leaving the central state machine wedged at ST_DISCOVERING
-# (c=1 wdc=0 in chain diag) while the earclip thinks the link is up and
-# is streaming. See narbis_ble_central.c arm-on-CONNECT_EVT discussion.
-CONFIG_BT_BLE_SMP_BOND_NVS_FLASH=n
 
 # CPU frequency 80MHz (saves ~20mA vs 160MHz)
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y

@@ -1,2 +1,9 @@
 /v4/Code-Glasses/build
-v4/Code-Glasses/.claude/worktrees/vigorous-margulis-a0f0af/
+v4/Code-Glasses/.claude/worktrees/
+
+# Generated sdkconfig variants — sdkconfig.defaults is the source of
+# truth. Committing these caused PRs #12-#19 to silently inherit
+# stale Bluedroid/SMP settings; never again.
+/v4/Code-Glasses/sdkconfig
+/v4/Code-Glasses/sdkconfig.old
+/v4/Code-Glasses/sdkconfig.txt
