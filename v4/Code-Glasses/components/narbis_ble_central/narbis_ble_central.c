@@ -69,9 +69,12 @@ static const char *TAG = "narbis_central";
 /* Watchdog for the connect+discover+subscribe chain. Armed right after
  * each ble_gap_connect() call. If state hasn't progressed to ST_READY by
  * the time this fires, we assume the chain wedged and force-recover.
- * 15 s is well above normal end-to-end (~3-5 s on a healthy earclip) but
- * tight enough that the user doesn't sit through 30 s of stuck DISCOVER. */
-#define CONNECT_WATCHDOG_MS        15000
+ * 25 s tolerates the slow chain-step turnaround seen at weak RSSI
+ * (-90 dBm) under the earclip's BATCHED profile (100 ms itvl + lat=4 ~
+ * 500 ms effective per ATT exchange — bench log on PR #22 showed 11 s
+ * just for descriptor discovery at -94 dBm). At healthy RSSI the chain
+ * still completes in ~3-5 s so this doesn't slow the common path. */
+#define CONNECT_WATCHDOG_MS        25000
 
 /* CCCD descriptor UUID (BLE-spec well-known). */
 #define BLE_UUID_CCCD              0x2902
@@ -994,17 +997,49 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         }
         S.last_seen_us = esp_timer_get_time();
 
-        /* Self-heal: notifies before READY means the subscribe chain
-         * succeeded but a CCCD-write ack was lost. Force the transition. */
-        if (S.state != ST_READY &&
-            (S.state == ST_SUBSCRIBING_IBI    ||
-             S.state == ST_SUBSCRIBING_CONFIG ||
-             S.state == ST_READING_CONFIG_INITIAL ||
-             S.state == ST_SUBSCRIBING_BATT   ||
-             S.state == ST_SUBSCRIBING_RAW    ||
-             S.state == ST_SUBSCRIBING_DIAG)) {
-            cb_log("central: notify mid-subscribe (st=%s) — force READY",
-                   state_name(S.state));
+        /* Subscribe-chain self-heal — surgical, per characteristic.
+         *
+         * The earclip ALWAYS sends an initial CONFIG notify the moment
+         * its CCCD is enabled (and similarly for other notify chars
+         * after their CCCDs go live). Under NimBLE the matching ATT
+         * Write Response usually arrives right after, but the order
+         * between Notify and Write Response is not guaranteed — at
+         * weak RSSI we sometimes see the Notify first.
+         *
+         * The previous logic jumped straight to READY on any notify in
+         * any subscribe state, which silently skipped the remaining
+         * subscribes (bench log on PR #22: SUB_CFG triggered force-
+         * READY, leaving BATT/RAW/DIAG never enabled → rx batt=0
+         * raw=0 diag=0 even after the chain "completed").
+         *
+         * Correct behavior: advance only one step, and only when the
+         * notify is on the exact characteristic we're currently
+         * subscribing. Receiving a CONFIG notify in SUB_CFG means CFG
+         * is live → advance to SUB_BATT (etc.). The Write Response cb
+         * (on_cccd_written) does the same advance when it arrives
+         * first, and is idempotent against the state check there. */
+        if (S.state == ST_SUBSCRIBING_IBI && attr_handle == S.hdl_ibi) {
+            cb_log("central: IBI notify mid-SUB_IBI — advance");
+            advance_to_config_or_batt_or_raw_or_diag_or_ready();
+        } else if (S.state == ST_SUBSCRIBING_CONFIG &&
+                   attr_handle == S.hdl_config) {
+            cb_log("central: CFG notify mid-SUB_CFG — advance");
+            read_config_initial();
+        } else if (S.state == ST_READING_CONFIG_INITIAL &&
+                   attr_handle == S.hdl_config) {
+            cb_log("central: CFG notify mid-READ_CFG — advance");
+            advance_to_batt_or_raw_or_diag_or_ready();
+        } else if (S.state == ST_SUBSCRIBING_BATT &&
+                   attr_handle == S.hdl_battery) {
+            cb_log("central: BATT notify mid-SUB_BATT — advance");
+            advance_to_raw_or_diag_or_ready();
+        } else if (S.state == ST_SUBSCRIBING_RAW &&
+                   attr_handle == S.hdl_raw) {
+            cb_log("central: RAW notify mid-SUB_RAW — advance");
+            advance_to_diag_or_ready();
+        } else if (S.state == ST_SUBSCRIBING_DIAG &&
+                   attr_handle == S.hdl_diag) {
+            cb_log("central: DIAG notify mid-SUB_DIAG — advance");
             enter_ready();
         }
         return 0;
