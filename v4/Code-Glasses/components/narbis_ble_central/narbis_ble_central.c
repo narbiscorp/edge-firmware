@@ -953,34 +953,37 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         return 0;
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
-        const struct ble_gap_event_notify_rx *n = &event->notify_rx;
-        if (n->conn_handle != S.conn_handle || n->om == NULL) return 0;
-        uint16_t len = OS_MBUF_PKTLEN(n->om);
+        /* event->notify_rx is an anonymous struct inside the union; access
+         * its members inline rather than via a typed pointer. */
+        if (event->notify_rx.conn_handle != S.conn_handle ||
+            event->notify_rx.om == NULL) return 0;
+        uint16_t attr_handle = event->notify_rx.attr_handle;
+        uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
         uint8_t buf[256];
         if (len > sizeof(buf)) return 0;
         uint16_t copied = 0;
-        if (ble_hs_mbuf_to_flat(n->om, buf, sizeof(buf), &copied) != 0) {
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, buf, sizeof(buf), &copied) != 0) {
             return 0;
         }
 
-        if (n->attr_handle == S.hdl_ibi && copied >= sizeof(narbis_ibi_payload_t)) {
+        if (attr_handle == S.hdl_ibi && copied >= sizeof(narbis_ibi_payload_t)) {
             narbis_ibi_payload_t pl;
             memcpy(&pl, buf, sizeof(pl));
             if (S.ibi_cb) S.ibi_cb(pl.ibi_ms, pl.confidence_x100, pl.flags);
             S.notify_ibi_count++;
-        } else if (n->attr_handle == S.hdl_battery &&
+        } else if (attr_handle == S.hdl_battery &&
                    copied >= sizeof(narbis_battery_payload_t)) {
             narbis_battery_payload_t pl;
             memcpy(&pl, buf, sizeof(pl));
             if (S.batt_cb) S.batt_cb(pl.soc_pct, pl.mv, pl.charging);
             S.notify_batt_count++;
-        } else if (n->attr_handle == S.hdl_config && S.config_cb) {
+        } else if (attr_handle == S.hdl_config && S.config_cb) {
             S.config_cb(buf, copied);
             S.notify_config_count++;
-        } else if (n->attr_handle == S.hdl_raw && S.raw_cb) {
+        } else if (attr_handle == S.hdl_raw && S.raw_cb) {
             S.raw_cb(buf, copied);
             S.notify_raw_count++;
-        } else if (n->attr_handle == S.hdl_diag && S.diag_cb) {
+        } else if (attr_handle == S.hdl_diag && S.diag_cb) {
             S.diag_cb(buf, copied);
             S.notify_diag_count++;
         } else {
