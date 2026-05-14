@@ -658,6 +658,46 @@ static void cache_handles_after_discover(void) {
            S.hdl_raw, S.hdl_raw_cccd);
 }
 
+/* Try to populate service handles directly from Bluedroid's GATT
+ * cache, bypassing the search_service → SEARCH_RES_EVT chain.
+ *
+ * Background: on the observed Bluedroid stack, SEARCH_RES_EVT is not
+ * always delivered to our gattc_cb even when search_service() returns
+ * ESP_OK and the underlying GATT exchange completes (chain diag shows
+ * c=N d=N srch=0 across multiple cycles). The earclip log
+ * independently shows the GATT layer reaching subscribed state, so
+ * Bluedroid IS caching the services internally — it's just not
+ * pushing the events up to the app.
+ *
+ * `esp_ble_gattc_get_service` queries that internal cache directly,
+ * returning the service's handle range. With that, the existing
+ * `cache_handles_after_discover` (which uses cache-based APIs
+ * exclusively) can populate hdl_* fields without needing
+ * SEARCH_RES_EVT.
+ *
+ * Returns true if S.hdl_ibi ends up non-zero (we got at least the
+ * critical IBI char handle and can proceed to subscribe). */
+static bool try_populate_handles_from_cache(void) {
+    if (S.hdl_ibi != 0) {
+        return true;  /* already populated by a real SEARCH_RES_EVT path */
+    }
+    esp_bt_uuid_t svc_uuid = { .len = ESP_UUID_LEN_128 };
+    memcpy(svc_uuid.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
+    uint16_t svc_count = 1;
+    esp_gattc_service_elem_t svc_elem;
+    esp_gatt_status_t st = esp_ble_gattc_get_service(
+        S.gattc_if, S.conn_id, &svc_uuid, &svc_elem, &svc_count, 0);
+    if (st != ESP_GATT_OK || svc_count == 0) {
+        return false;
+    }
+    S.svc_start_handle = svc_elem.start_handle;
+    S.svc_end_handle   = svc_elem.end_handle;
+    cb_log("central: service from cache %u..%u (bypass SEARCH_RES_EVT)",
+           S.svc_start_handle, S.svc_end_handle);
+    cache_handles_after_discover();
+    return S.hdl_ibi != 0;
+}
+
 static void write_peer_role(void) {
     if (S.hdl_peer_role == 0) {
         ESP_LOGW(TAG, "no peer-role char; earclip is older firmware");
@@ -855,6 +895,15 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
             if (src != ESP_OK) {
                 cb_log("central: search_service rc=%s", esp_err_to_name(src));
             }
+        }
+        /* Bypass attempt: if Bluedroid has the service cached from a
+         * prior session, we can populate handles directly without
+         * waiting for SEARCH_RES_EVT to fire. Likely to fail this early
+         * (the cache is populated by Bluedroid AFTER the GATT exchange
+         * completes), but cheap to try. The emit_diag pre-discovery
+         * self-heal will retry later if this returns false. */
+        if (try_populate_handles_from_cache()) {
+            write_peer_role();
         }
         break;
     }
@@ -1303,8 +1352,22 @@ void narbis_central_emit_diag(void) {
              S.last_seen_us != 0 &&
              (esp_timer_get_time() - S.last_seen_us) > (int64_t)CONNECT_WATCHDOG_MS * 1000LL) {
         int64_t elapsed_ms = (esp_timer_get_time() - S.last_seen_us) / 1000;
+        /* Before force-disconnecting, try the cache-driven bypass:
+         * Bluedroid often has the services cached internally even when
+         * it doesn't fire SEARCH_RES_EVT. If we can read the handles
+         * from the cache, populate them and advance the chain instead
+         * of throwing the link away. */
+        if (try_populate_handles_from_cache()) {
+            S.self_heals++;
+            cb_log("self-heal: pre-discovery wedge (%lld ms, state=%s) — recovered via cache, advancing",
+                   (long long)elapsed_ms, state_name(S.state));
+            write_peer_role();
+            return;
+        }
+        /* Cache didn't have it either — really wedged. Force-disconnect
+         * and let the scan + reconnect path try again. */
         S.self_heals++;
-        cb_log("self-heal: pre-discovery wedge (%lld ms, state=%s conn_id=%u) — force-disconnect",
+        cb_log("self-heal: pre-discovery wedge (%lld ms, state=%s conn_id=%u) — force-disconnect (cache empty)",
                (long long)elapsed_ms, state_name(S.state), (unsigned)S.conn_id);
         (void)esp_ble_gattc_close(S.gattc_if, S.conn_id);
         S.conn_id = 0;
