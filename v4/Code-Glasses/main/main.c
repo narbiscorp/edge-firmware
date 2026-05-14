@@ -1491,12 +1491,16 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"        /* v4.14.30: persistent user preferences */
-#include "esp_bt.h"
-#include "esp_gap_ble_api.h"
-#include "esp_gatts_api.h"
-#include "esp_bt_defs.h"
-#include "esp_bt_main.h"
-#include "esp_gatt_common_api.h"
+/* NimBLE host stack (Bluedroid -> NimBLE migration, see
+ * NIMBLE_MIGRATION_HANDOFF.md and sdkconfig.defaults). */
+#include "esp_bt.h"                      /* esp_bt_controller_mem_release */
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_uuid.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "driver/ledc.h"
@@ -2526,43 +2530,51 @@ typedef enum {
 static volatile ota_task_cmd_t ota_pending_cmd = OTA_TASK_NONE;
 static TaskHandle_t ota_task_handle = NULL;
 
-/* BLE handles */
-static uint16_t gatts_if_global = ESP_GATT_IF_NONE;
-static uint16_t conn_id_global = 0;
-static uint16_t service_handle = 0;
-static uint16_t ctrl_char_handle = 0;
-static uint16_t ota_char_handle = 0;
-static uint16_t status_char_handle = 0;
-static uint16_t ppg_char_handle = 0;               /* v4.12.0 */
-static uint16_t cccd_handle = 0;                   /* CCCD for status (0xFF03) */
-static uint16_t ppg_cccd_handle = 0;               /* v4.12.0: CCCD for PPG (0xFF04) */
-static uint8_t  gatts_init_step = 0;               /* v4.12.0: tracks which CCCD we're adding */
-static bool notifications_enabled = false;         /* Status notifications (0xFF03) */
+/* BLE handles (NimBLE).
+ *
+ * status_char_handle / ppg_char_handle keep their Bluedroid-era names so
+ * the existing notify-emit sites (send_status_frame, send_ota_status*,
+ * ble_log, ppg_emit_adc_stats, ppg_emit_health, coh_emit_packet,
+ * ppg_batch_flush) compile unchanged — they only ever fed the handle
+ * into esp_ble_gatts_send_indicate; now they feed it into nimble_notify().
+ * The handles are populated by on_gatts_register via val_handle pointers
+ * in the GATTS_CHRS table (mirrors earclip ble_service_narbis.c:322-334).
+ *
+ * g_conn_handle holds the single active dashboard connection (peripheral
+ * role); BLE_HS_CONN_HANDLE_NONE when no dashboard is connected. The
+ * separate earclip-as-central link is owned by narbis_ble_central and not
+ * tracked here. */
+static uint16_t status_char_handle = 0;            /* 0xFF03 val_handle */
+static uint16_t ppg_char_handle    = 0;            /* 0xFF04 val_handle */
+static uint16_t g_conn_handle      = 0xFFFF;       /* dashboard conn_handle */
+static uint8_t  g_own_addr_type    = 0;            /* set in on_ble_sync */
+static bool notifications_enabled  = false;        /* Status notifications (0xFF03) */
 static bool ppg_notifications_enabled = false;     /* v4.12.0: PPG notifications (0xFF04) */
 static bool is_connected = false;
+
+/* Forward-declared NimBLE notify helper. Defined inside the BLE NimBLE
+ * module block further below. Earlier code paths (OTA status, ble_log,
+ * coherence emit, PPG batch flush, etc.) reach into the dashboard link
+ * through this single entry point. Returns ESP_OK or an ESP error code
+ * mapped from the NimBLE return so existing ble_send_errors++ accounting
+ * stays correct. */
+static esp_err_t nimble_notify(uint16_t val_handle, const uint8_t *data, size_t len);
 
 /* Task handles */
 static TaskHandle_t led_task_handle = NULL;
 static TaskHandle_t ppg_task_handle = NULL;   /* v4.12.0 */
 
 /* Forward declarations for BLE auto-off helpers (v4.11.0/v4.11.1).
- * Defined after adv_params so they can reference it. Declared here so
- * hall_task and app_main (which live above adv_params) can call them. */
+ * Defined inside the NimBLE module block further below. Declared here so
+ * hall_task and app_main (which live above) can call them. */
 static void ble_adv_rearm(void);
 static void ble_adv_reset_deadline(void);
 static esp_err_t ble_stack_init(void);
 static esp_err_t ble_stack_teardown(void);
-
-/* Forward declarations for the GAP/GATT event handlers (v4.11.1).
- * ble_stack_init() calls esp_ble_gap_register_callback(gap_event_handler)
- * and esp_ble_gatts_register_callback(gatts_event_handler), both of which
- * are defined further down in the file. Without these forward decls the
- * v4.11.1 build fails with "undeclared identifier" on both names. */
-static void gap_event_handler(esp_gap_ble_cb_event_t event,
-                              esp_ble_gap_cb_param_t *param);
-static void gatts_event_handler(esp_gatts_cb_event_t event,
-                                esp_gatt_if_t gatts_if,
-                                esp_ble_gatts_cb_param_t *param);
+/* NimBLE single GAP event handler (replaces Bluedroid's split gap/gatts
+ * handlers and the narbis_central_gap_event forwarder; central registers
+ * its own per-call cb with NimBLE). */
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg);
 
 /*******************************************************************************
  * PWM FUNCTIONS
@@ -3039,15 +3051,13 @@ static void send_ota_status(uint8_t status, uint8_t extra1, uint8_t extra2, uint
     size_t len = (status == OTA_STATUS_PROGRESS) ? 4 : 
                  (status == OTA_STATUS_ERROR) ? 2 : 1;
     
-    esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global, 
-                                 status_char_handle, len, notify_data, false);
+    nimble_notify(status_char_handle, notify_data, len);
 }
 
 /* Send arbitrary-length OTA status notification (for page CRC etc.) */
 static void send_ota_status_raw(uint8_t *data, size_t len) {
     if (!notifications_enabled || !is_connected) return;
-    esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global,
-                                 status_char_handle, len, data, false);
+    nimble_notify(status_char_handle, data, len);
 }
 
 /*******************************************************************************
@@ -3078,8 +3088,7 @@ static void ble_log(const char *fmt, ...) {
     va_end(args);
     if (n < 0) return;
     if (n > (int)(sizeof(pkt) - 1)) n = sizeof(pkt) - 1;
-    esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global,
-                                status_char_handle, 1 + n, pkt, false);
+    nimble_notify(status_char_handle, pkt, (size_t)(1 + n));
 }
 
 /* Path B Phase 1/2: emit a binary status frame on 0xFF03.
@@ -3096,9 +3105,7 @@ static void send_status_frame(uint8_t type, const uint8_t *payload, size_t len) 
     uint8_t pkt[241];
     pkt[0] = type;
     if (len > 0 && payload) memcpy(pkt + 1, payload, len);
-    esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global,
-                                status_char_handle,
-                                (uint16_t)(1 + len), pkt, false);
+    nimble_notify(status_char_handle, pkt, (size_t)(1 + len));
 }
 
 /* Ring of recent ADC reads for stats — updated by ppg_task inline,
@@ -3142,8 +3149,7 @@ static void ppg_emit_adc_stats(void) {
     pkt[8]  = 0;
     pkt[9]  = 0;
     pkt[10] = 0;
-    esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global,
-                                status_char_handle, sizeof(pkt), pkt, false);
+    nimble_notify(status_char_handle, pkt, sizeof(pkt));
 }
 
 /*******************************************************************************
@@ -3206,8 +3212,7 @@ static void ppg_emit_health(void) {
     pkt[18] = (uint8_t)((jit_max16 >> 8) & 0xFF);
     pkt[19] = jit_over8;
 
-    esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global,
-                                status_char_handle, sizeof(pkt), pkt, false);
+    nimble_notify(status_char_handle, pkt, sizeof(pkt));
 }
 
 /*******************************************************************************
@@ -4459,94 +4464,399 @@ static void process_ota_data(uint8_t *data, uint16_t len) {
 }
 
 /*******************************************************************************
- * BLE ADVERTISING PARAMETERS (Power Optimized)
+ * BLE NIMBLE PERIPHERAL MODULE  (Bluedroid -> NimBLE migration)
+ *
+ * Defines the dashboard-facing GATT service (0x00FF with CTRL/OTA/STATUS/PPG
+ * chars at 0xFF01-0xFF04), access callbacks, the unified GAP event handler
+ * that tracks the single dashboard connection, advertising, the NimBLE host
+ * task, plus the BLE stack lifecycle helpers used by hall_task and app_main.
+ *
+ * NimBLE merges Bluedroid's separate gap_event_handler / gatts_event_handler
+ * into a single per-call cb. The narbis_central_gap_event forwarder is gone;
+ * the central registers its own event cb directly with NimBLE for scan and
+ * connect operations.
+ *
+ * State invariants (unchanged from the Bluedroid era):
+ *   ble_stack_up == false  =>  ble_adv_active == false AND is_connected == false
+ *   ble_adv_active == true =>  ble_stack_up == true
+ *
+ * Handle lifetimes: status_char_handle / ppg_char_handle become valid after
+ * ble_gatts_add_svcs registers the service table and the val_handle pointers
+ * in DASHBOARD_CHRS are filled in. They survive across the auto-off teardown
+ * because we keep the NimBLE host task alive; only advertising is stopped.
  ******************************************************************************/
-static esp_ble_adv_params_t adv_params = {
-    .adv_int_min        = ADV_INT_MIN,   /* 100ms (v4.9.12) */
-    .adv_int_max        = ADV_INT_MAX,   /* 200ms (v4.9.12) */
-    .adv_type           = ADV_TYPE_IND,
-    .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
-    .channel_map        = ADV_CHNL_ALL,
-    .adv_filter_policy  = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+
+/* GATT characteristic UUIDs as ble_uuid16_t literals. The 0x00FF service is
+ * Edge-compatible (single OTA webapp updates both products). */
+static const ble_uuid16_t SVC_UUID_DASHBOARD = BLE_UUID16_INIT(GATTS_SERVICE_UUID);
+static const ble_uuid16_t CHR_UUID_CTRL      = BLE_UUID16_INIT(GATTS_CHAR_UUID_CTRL);
+static const ble_uuid16_t CHR_UUID_OTA       = BLE_UUID16_INIT(GATTS_CHAR_UUID_OTA);
+static const ble_uuid16_t CHR_UUID_STATUS    = BLE_UUID16_INIT(GATTS_CHAR_UUID_STATUS);
+static const ble_uuid16_t CHR_UUID_PPG       = BLE_UUID16_INIT(GATTS_CHAR_UUID_PPG);
+
+/* Forward decls — access callbacks are defined below the service table. */
+static int access_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle,
+                          struct ble_gatt_access_ctxt *ctxt, void *arg);
+static int access_ota_cb(uint16_t conn_handle, uint16_t attr_handle,
+                         struct ble_gatt_access_ctxt *ctxt, void *arg);
+static int access_notify_only_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                 struct ble_gatt_access_ctxt *ctxt, void *arg);
+static void start_advertising(void);
+
+/* GATT service table — mirrors earclip's NARBIS_CHRS / NARBIS_SVC_DEFS.
+ * val_handle pointers receive each char's value handle when the service is
+ * registered; status_char_handle / ppg_char_handle then drive nimble_notify().
+ * CTRL and OTA are write-only from the dashboard, so no val_handle storage. */
+static const struct ble_gatt_chr_def DASHBOARD_CHRS[] = {
+    {
+        .uuid       = &CHR_UUID_CTRL.u,
+        .access_cb  = access_ctrl_cb,
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        .val_handle = NULL,
+    },
+    {
+        .uuid       = &CHR_UUID_OTA.u,
+        .access_cb  = access_ota_cb,
+        .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+        .val_handle = NULL,
+    },
+    {
+        .uuid       = &CHR_UUID_STATUS.u,
+        .access_cb  = access_notify_only_cb,
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &status_char_handle,
+    },
+    {
+        .uuid       = &CHR_UUID_PPG.u,
+        .access_cb  = access_notify_only_cb,
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &ppg_char_handle,
+    },
+    { 0 }
 };
 
-static esp_ble_adv_data_t adv_data = {
-    .set_scan_rsp        = false,
-    .include_name        = true,
-    .include_txpower     = false,
-    .flag                = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+static const struct ble_gatt_svc_def DASHBOARD_SVCS[] = {
+    {
+        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid            = &SVC_UUID_DASHBOARD.u,
+        .characteristics = DASHBOARD_CHRS,
+    },
+    { 0 }
 };
+
+/* Single NimBLE notify entry point. status_char_handle / ppg_char_handle
+ * are populated by the val_handle pointers in DASHBOARD_CHRS once the
+ * service is registered. Returns ESP_OK on dispatch, ESP_ERR_INVALID_STATE
+ * if no dashboard is connected or the char hasn't been registered yet. */
+static esp_err_t nimble_notify(uint16_t val_handle, const uint8_t *data, size_t len) {
+    if (g_conn_handle == 0xFFFF) return ESP_ERR_INVALID_STATE;
+    if (val_handle == 0)         return ESP_ERR_INVALID_STATE;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
+    if (om == NULL)              return ESP_ERR_NO_MEM;
+    int rc = ble_gatts_notify_custom(g_conn_handle, val_handle, om);
+    return (rc == 0) ? ESP_OK : ESP_FAIL;
+}
+
+/* CTRL char (0xFF01): pull the write payload into a flat buffer and hand
+ * it to the existing process_command() opcode dispatcher unchanged.
+ * Mirrors earclip ble_service_narbis.c access_config_write pattern. */
+static int access_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle,
+                          struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return 0;
+    uint8_t buf[256];
+    uint16_t copied = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &copied) != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    if (copied == 0) return 0;
+    process_command(buf, copied);
+    return 0;
+}
+
+/* OTA char (0xFF02): page chunks up to MTU-3 = 244 bytes per write. */
+static int access_ota_cb(uint16_t conn_handle, uint16_t attr_handle,
+                         struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return 0;
+    uint8_t buf[260];
+    uint16_t copied = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &copied) != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    if (copied == 0) return 0;
+    process_ota_data(buf, copied);
+    return 0;
+}
+
+/* STATUS (0xFF03) / PPG (0xFF04): notify-only. Read returns zero bytes
+ * (compat with clients that probe via a read on subscribe); writes
+ * rejected. Subscribe state changes arrive via BLE_GAP_EVENT_SUBSCRIBE
+ * in ble_gap_event_cb, not here. */
+static int access_notify_only_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                 struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) return 0;
+    return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+}
+
+/* Configure and start advertising. Adv data is flags + name only (16 B,
+ * inside the 31-byte adv limit). No service UUID — dashboard's Web
+ * Bluetooth filters by device name "Narbis_Edge". */
+static void start_advertising(void) {
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t *)DEVICE_NAME;
+    fields.name_len = strlen(DEVICE_NAME);
+    fields.name_is_complete = 1;
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) { ESP_LOGE(TAG, "adv_set_fields: %d", rc); return; }
+
+    struct ble_gap_adv_params params = {0};
+    params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    /* itvl_* in 0.625 ms units (same encoding as Bluedroid's adv_int_*).
+     * ADV_INT_MIN=0x0A0 = 100 ms, _MAX=0x140 = 200 ms (v4.9.12). */
+    params.itvl_min  = ADV_INT_MIN;
+    params.itvl_max  = ADV_INT_MAX;
+
+    rc = ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER,
+                           &params, ble_gap_event_cb, NULL);
+    if (rc == 0) {
+        ble_adv_active = true;
+        ESP_LOGI(TAG, "Advertising started");
+    } else {
+        ble_adv_active = false;
+        ESP_LOGE(TAG, "adv_start: %d", rc);
+    }
+}
+
+/* GATTS register callback. Logs each char's value handle as it's wired up;
+ * the actual storage already lives in status_char_handle / ppg_char_handle
+ * via the val_handle pointers in DASHBOARD_CHRS. */
+static void on_gatts_register(struct ble_gatt_register_ctxt *ctxt, void *arg) {
+    (void)arg;
+    if (ctxt->op == BLE_GATT_REGISTER_OP_CHR) {
+        char buf[BLE_UUID_STR_LEN];
+        ble_uuid_to_str(ctxt->chr.chr_def->uuid, buf);
+        ESP_LOGI(TAG, "gatts: chr %s val_handle=%d", buf, ctxt->chr.val_handle);
+    }
+}
+
+/* Single unified GAP/GATTS event handler. Tracks dashboard connection
+ * (g_conn_handle) and per-char subscribe state (notifications_enabled,
+ * ppg_notifications_enabled). Mirror of earclip transport_ble.c:399-547. */
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
+    (void)arg;
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            g_conn_handle = event->connect.conn_handle;
+            is_connected  = true;
+            ble_adv_active = false;
+            ble_idle_deadline_tick = 0;
+            ESP_LOGI(TAG, "Client connected, conn_handle %d", g_conn_handle);
+
+            /* Dashboard conn-update. v4.10.1: 20 s supervision (OTA erase
+             * holds the radio silent up to 19 s). v4.12.8: 20-30 ms
+             * interval, latency=1 for balanced power + throughput. NimBLE
+             * units match Bluedroid: itvl_* in 1.25 ms units, latency in
+             * conn events, supervision_timeout in 10 ms units. */
+            struct ble_gap_upd_params upd = {
+                .itvl_min            = 0x10,    /* 20 ms */
+                .itvl_max            = 0x18,    /* 30 ms */
+                .latency             = 1,
+                .supervision_timeout = 2000,    /* 20 s */
+                .min_ce_len          = 0,
+                .max_ce_len          = 0,
+            };
+            int rc = ble_gap_update_params(g_conn_handle, &upd);
+            if (rc != 0) ESP_LOGW(TAG, "conn_update_params: %d", rc);
+        } else {
+            ESP_LOGW(TAG, "Connect failed status=%d, restart adv",
+                     event->connect.status);
+            start_advertising();
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "Client disconnected reason=0x%04x",
+                 event->disconnect.reason);
+        g_conn_handle = 0xFFFF;
+        is_connected = false;
+        notifications_enabled = false;
+        ppg_notifications_enabled = false;
+        ppg_batch_count = 0;        /* v4.14.9: drop pending batch */
+
+        if (in_ota_mode) {
+            esp_ota_abort(ota_handle);
+            in_ota_mode = false;
+            ESP_LOGW(TAG, "OTA cancelled due to disconnect");
+        }
+
+        /* Restart adv with a fresh auto-off window (v4.11.0). */
+        start_advertising();
+        ble_adv_reset_deadline();
+        return 0;
+
+    case BLE_GAP_EVENT_MTU:
+        ESP_LOGI(TAG, "MTU exchanged conn=%d mtu=%d",
+                 event->mtu.conn_handle, event->mtu.value);
+        return 0;
+
+    case BLE_GAP_EVENT_SUBSCRIBE: {
+        bool rising = event->subscribe.cur_notify && !event->subscribe.prev_notify;
+        if (event->subscribe.attr_handle == status_char_handle) {
+            notifications_enabled = event->subscribe.cur_notify;
+            ESP_LOGI(TAG, "Status notifications %s",
+                     notifications_enabled ? "enabled" : "disabled");
+            if (rising) {
+                /* v4.12.1: announce firmware on subscribe so the dashboard's
+                 * firmware log immediately shows what build is running. */
+                ble_log("Narbis fw v%s test=%d mode=%d",
+                        FIRMWARE_VERSION, PPG_TEST_BUILD, (int)led_mode);
+                /* Refresh fresh dashboard with current relay state — the
+                 * 0xF6 + handles diagnostic that fired during boot went into
+                 * the void (no client). Do it now so the badge + log catch up. */
+                bool relay_up = narbis_central_is_connected();
+                uint8_t pkt = relay_up ? 1u : 0u;
+                send_status_frame(0xF6, &pkt, 1);
+                ble_log("relay %s (refresh on dashboard connect)",
+                        relay_up ? "linked" : "lost");
+                narbis_central_emit_diag();
+            }
+        } else if (event->subscribe.attr_handle == ppg_char_handle) {
+            ppg_notifications_enabled = event->subscribe.cur_notify;
+            ESP_LOGI(TAG, "PPG notifications %s",
+                     ppg_notifications_enabled ? "enabled" : "disabled");
+        }
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        ESP_LOGI(TAG, "Conn update status=%d", event->conn_update.status);
+        return 0;
+
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        ESP_LOGI(TAG, "Adv complete reason=%d", event->adv_complete.reason);
+        ble_adv_active = false;
+        return 0;
+
+    default:
+        return 0;
+    }
+}
+
+/* Sync callback — fires once NimBLE host is ready. Resolve our address
+ * type, set the preferred MTU, apply TX power, kick off advertising. */
+static void on_ble_sync(void) {
+    int rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_id_infer_auto: %d", rc);
+        return;
+    }
+    rc = ble_att_set_preferred_mtu(247);
+    if (rc != 0) ESP_LOGW(TAG, "preferred_mtu: %d", rc);
+
+    /* v4.9.12 TX power scheme, preserved across migration. ADV at -6 dBm
+     * for first-try-connect link margin; DEFAULT at -6 dBm; CONN_HDL0 at
+     * -12 dBm for steady-state power. These call into the controller layer
+     * below the host, so they work identically on NimBLE. */
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT,   ESP_PWR_LVL_N6);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,       ESP_PWR_LVL_N6);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, ESP_PWR_LVL_N12);
+
+    start_advertising();
+}
+
+static void on_ble_reset(int reason) {
+    ESP_LOGW(TAG, "NimBLE reset reason=%d", reason);
+}
+
+/* NimBLE host task — runs the event loop until host shutdown. */
+static void ble_host_task(void *param) {
+    (void)param;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
 
 /*******************************************************************************
- * BLE STACK LIFECYCLE HELPERS (v4.11.0 / v4.11.1)
+ * BLE STACK LIFECYCLE  (NimBLE)
  *
- * Rationale: v4.9.12 changed advertising to -6dBm at 100-200ms for faster
- * first-try connects, which added ~4mA to idle current. That cost is only
- * worth paying in the window when the user actually wants to connect.
+ * Original rationale (v4.11.0/v4.11.1, preserved across the NimBLE migration):
+ *   v4.9.12 advertising at -6 dBm / 100-200 ms costs ~4 mA when idle. Stop
+ *   advertising after BLE_IDLE_TIMEOUT_MS to reclaim that current; restart
+ *   on hall events or boot.
  *
- * v4.11.0 stopped advertising after BLE_IDLE_TIMEOUT_MS but left the
- * controller and Bluedroid running — current traces showed residual
- * ~1.5A RF spikes from BT controller housekeeping. v4.11.1 escalates to
- * full BT stack teardown so the radio is completely cold.
+ * NimBLE specifics:
+ *   - nimble_port_init can be called once per boot. Teardown stops adv only
+ *     and keeps the NimBLE host task running. Stopping adv is sufficient to
+ *     drop the ~4 mA idle PA burst that the auto-off path targeted; the
+ *     remaining host overhead is ~µA level and not worth the complex
+ *     port_stop/deinit/re-init sequencing.
+ *   - on_ble_sync (fires async after nimble_port_freertos_init) is the
+ *     point where the address type is resolved and advertising actually
+ *     starts. ble_stack_init returns immediately after kicking off the host
+ *     task; expect Advertising started log within a few hundred ms.
  *
- * ble_stack_init():      Bring up BT controller + Bluedroid + GATT app.
- *                        Idempotent. Returns ESP_OK if already up.
- * ble_stack_teardown():  Tear down everything initialized by init().
- *                        Idempotent. Returns ESP_OK if already down.
- * ble_adv_rearm():       Ensure stack is up and advertising; reset deadline.
- *                        Called on boot, hall events, disconnect.
- * ble_adv_reset_deadline(): Push deadline out another window.
+ * API:
+ *   ble_stack_init():        Bring up NimBLE (idempotent).
+ *   ble_stack_teardown():    Stop adv + clear conn state (idempotent).
+ *   ble_adv_rearm():         Ensure host up and advertising; reset deadline.
+ *   ble_adv_reset_deadline():Push deadline out one window.
  *
- * The actual teardown trigger happens in app_main's 1Hz loop when the
- * deadline elapses, not in these helpers.
- *
- * State invariants:
- *   ble_stack_up == false  ⟹  ble_adv_active == false AND is_connected == false
- *   ble_adv_active == true ⟹  ble_stack_up == true
- *
- * Handle lifetimes: gatts_if_global, service_handle, ctrl_char_handle,
- * ota_char_handle, status_char_handle, cccd_handle all become invalid
- * across teardown and are repopulated by the GATT event handler when
- * the new GATT app registers on the next init.
+ * State invariants (unchanged from Bluedroid era):
+ *   ble_stack_up == false  =>  ble_adv_active == false AND is_connected == false
+ *   ble_adv_active == true =>  ble_stack_up == true
  ******************************************************************************/
+static bool nimble_port_initialized = false;
+
 static void ble_adv_reset_deadline(void) {
     ble_idle_deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(BLE_IDLE_TIMEOUT_MS);
 }
 
 static esp_err_t ble_stack_init(void) {
     if (ble_stack_up) return ESP_OK;
+    ESP_LOGI(TAG, "BLE stack init (NimBLE)...");
 
-    ESP_LOGI(TAG, "BLE stack init...");
+    if (!nimble_port_initialized) {
+        esp_log_level_set("NimBLE", ESP_LOG_WARN);
+        esp_err_t err = nimble_port_init();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "nimble_port_init: %s", esp_err_to_name(err));
+            return err;
+        }
 
-    esp_err_t err;
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    err = esp_bt_controller_init(&bt_cfg);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "bt_controller_init: %s", esp_err_to_name(err)); return err; }
+        ble_hs_cfg.sync_cb           = on_ble_sync;
+        ble_hs_cfg.reset_cb          = on_ble_reset;
+        ble_hs_cfg.gatts_register_cb = on_gatts_register;
+        ble_hs_cfg.store_status_cb   = NULL;
 
-    err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "bt_controller_enable: %s", esp_err_to_name(err)); return err; }
+        ble_svc_gap_init();
+        ble_svc_gatt_init();
 
-    err = esp_bluedroid_init();
-    if (err != ESP_OK) { ESP_LOGE(TAG, "bluedroid_init: %s", esp_err_to_name(err)); return err; }
+        int rc = ble_svc_gap_device_name_set(DEVICE_NAME);
+        if (rc != 0) ESP_LOGW(TAG, "device_name_set: %d", rc);
 
-    err = esp_bluedroid_enable();
-    if (err != ESP_OK) { ESP_LOGE(TAG, "bluedroid_enable: %s", esp_err_to_name(err)); return err; }
+        rc = ble_gatts_count_cfg(DASHBOARD_SVCS);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ble_gatts_count_cfg: %d", rc);
+            return ESP_FAIL;
+        }
+        rc = ble_gatts_add_svcs(DASHBOARD_SVCS);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ble_gatts_add_svcs: %d", rc);
+            return ESP_FAIL;
+        }
 
-    /* Re-register callbacks and GATT app. The GATT app registration will
-     * trigger ADD_CHAR events etc. in the GATT handler, which repopulates
-     * the service/char handles and ultimately starts advertising via the
-     * ADV_DATA_SET_COMPLETE_EVT path. */
-    err = esp_ble_gap_register_callback(gap_event_handler);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "gap_register_callback: %s", esp_err_to_name(err)); return err; }
-
-    err = esp_ble_gatts_register_callback(gatts_event_handler);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "gatts_register_callback: %s", esp_err_to_name(err)); return err; }
-
-    err = esp_ble_gatts_app_register(GATTS_APP_ID);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "gatts_app_register: %s", esp_err_to_name(err)); return err; }
-
-    err = esp_ble_gatt_set_local_mtu(517);
-    if (err != ESP_OK) { ESP_LOGW(TAG, "set_local_mtu: %s", esp_err_to_name(err)); /* non-fatal */ }
+        nimble_port_freertos_init(ble_host_task);
+        nimble_port_initialized = true;
+        /* on_ble_sync fires async once the host is ready; it resolves our
+         * address, sets MTU, applies TX power, and starts advertising. */
+    } else {
+        /* Re-arm path: host still alive across an auto-off teardown. */
+        start_advertising();
+    }
 
     ble_stack_up = true;
     ESP_LOGI(TAG, "BLE stack up");
@@ -4555,40 +4865,16 @@ static esp_err_t ble_stack_init(void) {
 
 static esp_err_t ble_stack_teardown(void) {
     if (!ble_stack_up) return ESP_OK;
-
-    ESP_LOGI(TAG, "BLE stack teardown (radio off)");
-
-    /* Order matters: disable/deinit Bluedroid first (it uses the controller),
-     * then disable/deinit the controller. Ignore errors — we're going down
-     * regardless, and partial teardown is worse than ugly logs. */
+    ESP_LOGI(TAG, "BLE stack teardown (adv stop)");
     if (ble_adv_active) {
-        esp_ble_gap_stop_advertising();
-        /* ADV_STOP_COMPLETE_EVT may not fire before we kill the stack —
-         * clear the flag manually so state stays consistent. */
+        ble_gap_adv_stop();
         ble_adv_active = false;
     }
-
-    esp_err_t err;
-    err = esp_bluedroid_disable();
-    if (err != ESP_OK) ESP_LOGW(TAG, "bluedroid_disable: %s", esp_err_to_name(err));
-    err = esp_bluedroid_deinit();
-    if (err != ESP_OK) ESP_LOGW(TAG, "bluedroid_deinit: %s", esp_err_to_name(err));
-    err = esp_bt_controller_disable();
-    if (err != ESP_OK) ESP_LOGW(TAG, "bt_controller_disable: %s", esp_err_to_name(err));
-    err = esp_bt_controller_deinit();
-    if (err != ESP_OK) ESP_LOGW(TAG, "bt_controller_deinit: %s", esp_err_to_name(err));
-
-    /* Invalidate BLE-dependent handles. is_connected must already be false
-     * here since timeout gates on !is_connected. */
     ble_stack_up = false;
-    gatts_if_global = ESP_GATT_IF_NONE;
-    ctrl_char_handle = 0;
-    ota_char_handle = 0;
-    status_char_handle = 0;
-    cccd_handle = 0;
-    service_handle = 0;
+    is_connected = false;
+    g_conn_handle = 0xFFFF;
     notifications_enabled = false;
-
+    ppg_notifications_enabled = false;
     ble_idle_deadline_tick = 0;
     return ESP_OK;
 }
@@ -4600,336 +4886,22 @@ static void ble_adv_rearm(void) {
         return;
     }
 
-    /* Bring stack up if it was torn down by the auto-off timeout.
-     * Advertising itself starts asynchronously via the GATT service-create
-     * flow, so once the stack is up the first time we just wait. */
     if (!ble_stack_up) {
         esp_err_t err = ble_stack_init();
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "BLE re-arm failed to init stack: %s", esp_err_to_name(err));
             return;
         }
-        /* Advertising will start asynchronously via ADV_DATA_SET_COMPLETE_EVT.
-         * Arm the deadline now; if adv never comes up the flag stays false
-         * and the timeout check is gated on ble_adv_active anyway. */
         ble_adv_reset_deadline();
-        ESP_LOGI(TAG, "BLE re-armed via stack init (60s window)");
+        ESP_LOGI(TAG, "BLE re-armed via stack init");
         return;
     }
 
-    /* Stack was already up (e.g. boot path, or rapid re-arm). Just make
-     * sure advertising is running and reset the deadline. */
+    /* Stack was already up. Just make sure advertising is running. */
     if (!ble_adv_active) {
-        esp_err_t err = esp_ble_gap_start_advertising(&adv_params);
-        if (err == ESP_OK) {
-            ble_adv_active = true;
-            ESP_LOGI(TAG, "BLE advertising re-armed (60s window)");
-        } else {
-            ESP_LOGW(TAG, "BLE adv start failed: %s", esp_err_to_name(err));
-            return;
-        }
+        start_advertising();
     }
     ble_adv_reset_deadline();
-}
-
-/*******************************************************************************
- * GAP EVENT HANDLER
- ******************************************************************************/
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
-    /* Path B: Bluedroid only allows one GAP callback. Forward every event
-     * to the BLE central module so it can drive scan + open. The
-     * peripheral-only events (adv lifecycle) are handled below. */
-    narbis_central_gap_event(event, param);
-
-    switch (event) {
-        case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-            esp_ble_gap_start_advertising(&adv_params);
-            break;
-
-        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            if (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
-                ble_adv_active = true;  /* v4.11.0: track state */
-                ESP_LOGI(TAG, "Advertising started");
-            } else {
-                ble_adv_active = false;
-                ESP_LOGE(TAG, "Advertising failed");
-            }
-            break;
-
-        case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:  /* v4.11.0: track state */
-            ble_adv_active = false;
-            ESP_LOGI(TAG, "Advertising stopped");
-            break;
-
-        default:
-            break;
-    }
-}
-
-/*******************************************************************************
- * GATT EVENT HANDLER
- ******************************************************************************/
-static void gatts_event_handler(esp_gatts_cb_event_t event, 
-                                 esp_gatt_if_t gatts_if,
-                                 esp_ble_gatts_cb_param_t *param) {
-    
-    switch (event) {
-        case ESP_GATTS_REG_EVT:
-            ESP_LOGI(TAG, "GATT app registered");
-            gatts_if_global = gatts_if;
-            
-            /* Set device name */
-            esp_ble_gap_set_device_name(DEVICE_NAME);
-            
-            /* v4.9.12: Dual TX power scheme for reliable connects + low power.
-             *   - ADV / DEFAULT at -6dBm: advertising packets arrive at the
-             *     phone with ~4× the signal strength of v4.9.11, giving the
-             *     handshake plenty of link margin. Biggest single win for
-             *     first-try connect reliability.
-             *   - CONN_HDL0 at -12dBm: once connected, the link is already
-             *     established and a weaker signal is sufficient. Keeps
-             *     per-session power draw close to v4.9.11 baseline.
-             * Previously all three were -12dBm (overly conservative for adv). */
-            esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT,   ESP_PWR_LVL_N6);
-            esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,       ESP_PWR_LVL_N6);
-            esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, ESP_PWR_LVL_N12);
-            
-            /* Configure advertising */
-            esp_ble_gap_config_adv_data(&adv_data);
-            
-            /* Create service */
-            esp_gatt_srvc_id_t service_id = {
-                .is_primary = true,
-                .id = {
-                    .inst_id = 0,
-                    .uuid = {
-                        .len = ESP_UUID_LEN_16,
-                        .uuid = {.uuid16 = GATTS_SERVICE_UUID}
-                    }
-                }
-            };
-            esp_ble_gatts_create_service(gatts_if, &service_id, GATTS_NUM_HANDLE);
-            break;
-            
-        case ESP_GATTS_CREATE_EVT:
-            service_handle = param->create.service_handle;
-            ESP_LOGI(TAG, "Service created, handle %d", service_handle);
-            esp_ble_gatts_start_service(service_handle);
-            
-            /* Add Control characteristic (0xFF01) */
-            esp_bt_uuid_t ctrl_uuid = {
-                .len = ESP_UUID_LEN_16,
-                .uuid = {.uuid16 = GATTS_CHAR_UUID_CTRL}
-            };
-            esp_ble_gatts_add_char(service_handle, &ctrl_uuid,
-                                   ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-                                   ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE,
-                                   NULL, NULL);
-            break;
-            
-        case ESP_GATTS_ADD_CHAR_EVT: {
-            uint16_t char_uuid = param->add_char.char_uuid.uuid.uuid16;
-            
-            if (char_uuid == GATTS_CHAR_UUID_CTRL) {
-                ctrl_char_handle = param->add_char.attr_handle;
-                ESP_LOGI(TAG, "Char added step 0, handle %d", ctrl_char_handle);
-                
-                /* Add OTA Data characteristic (0xFF02) */
-                esp_bt_uuid_t ota_uuid = {
-                    .len = ESP_UUID_LEN_16,
-                    .uuid = {.uuid16 = GATTS_CHAR_UUID_OTA}
-                };
-                esp_ble_gatts_add_char(service_handle, &ota_uuid,
-                                       ESP_GATT_PERM_WRITE,
-                                       ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR,
-                                       NULL, NULL);
-            }
-            else if (char_uuid == GATTS_CHAR_UUID_OTA) {
-                ota_char_handle = param->add_char.attr_handle;
-                ESP_LOGI(TAG, "Char added step 1, handle %d", ota_char_handle);
-                
-                /* Add Status characteristic (0xFF03) with notify */
-                esp_bt_uuid_t status_uuid = {
-                    .len = ESP_UUID_LEN_16,
-                    .uuid = {.uuid16 = GATTS_CHAR_UUID_STATUS}
-                };
-                esp_ble_gatts_add_char(service_handle, &status_uuid,
-                                       ESP_GATT_PERM_READ,
-                                       ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY,
-                                       NULL, NULL);
-            }
-            else if (char_uuid == GATTS_CHAR_UUID_STATUS) {
-                status_char_handle = param->add_char.attr_handle;
-                ESP_LOGI(TAG, "Char added step 2, handle %d", status_char_handle);
-                
-                /* Add CCCD for status notifications (first of two CCCDs).
-                 * gatts_init_step lets ADD_CHAR_DESCR_EVT know this one
-                 * belongs to the status char. */
-                gatts_init_step = 0;
-                esp_bt_uuid_t cccd_uuid = {
-                    .len = ESP_UUID_LEN_16,
-                    .uuid = {.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG}
-                };
-                esp_ble_gatts_add_char_descr(service_handle, &cccd_uuid,
-                                              ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-                                              NULL, NULL);
-            }
-            else if (char_uuid == GATTS_CHAR_UUID_PPG) {
-                /* v4.12.0: PPG characteristic added. Now add its CCCD
-                 * so clients can subscribe. */
-                ppg_char_handle = param->add_char.attr_handle;
-                ESP_LOGI(TAG, "Char added step 3 (PPG), handle %d", ppg_char_handle);
-
-                gatts_init_step = 1;
-                esp_bt_uuid_t cccd_uuid = {
-                    .len = ESP_UUID_LEN_16,
-                    .uuid = {.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG}
-                };
-                esp_ble_gatts_add_char_descr(service_handle, &cccd_uuid,
-                                              ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-                                              NULL, NULL);
-            }
-            break;
-        }
-        
-        case ESP_GATTS_ADD_CHAR_DESCR_EVT:
-            /* v4.12.0: two CCCDs are added in sequence (one for 0xFF03,
-             * one for 0xFF04). gatts_init_step tracks which one we just
-             * got back. On the first one, also kick off adding the PPG
-             * characteristic — the chain has to go CHAR → CCCD → CHAR
-             * → CCCD to keep the ESP BLE stack happy. */
-            if (gatts_init_step == 0) {
-                cccd_handle = param->add_char_descr.attr_handle;
-                ESP_LOGI(TAG, "Status CCCD handle %d", cccd_handle);
-
-                /* Now add the PPG characteristic (0xFF04). */
-                esp_bt_uuid_t ppg_uuid = {
-                    .len = ESP_UUID_LEN_16,
-                    .uuid = {.uuid16 = GATTS_CHAR_UUID_PPG}
-                };
-                esp_ble_gatts_add_char(service_handle, &ppg_uuid,
-                                       ESP_GATT_PERM_READ,
-                                       ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY,
-                                       NULL, NULL);
-            } else {
-                ppg_cccd_handle = param->add_char_descr.attr_handle;
-                ESP_LOGI(TAG, "PPG CCCD handle %d - BLE setup complete", ppg_cccd_handle);
-                ESP_LOGI(TAG, "Handles: ctrl=%d ota=%d status=%d ppg=%d",
-                         ctrl_char_handle, ota_char_handle, status_char_handle, ppg_char_handle);
-                ESP_LOGI(TAG, "OTA: A8=start A9=finish AA=cancel");
-            }
-            break;
-            
-        case ESP_GATTS_CONNECT_EVT:
-            is_connected = true;
-            conn_id_global = param->connect.conn_id;
-            ble_idle_deadline_tick = 0;  /* v4.11.0: disable auto-off while connected */
-            ESP_LOGI(TAG, "Client connected, conn_id %d", conn_id_global);
-            
-            /* Update connection parameters for power saving.
-             * v4.10.1: supervision timeout 4s -> 20s. OTA partition erase
-             * (esp_ota_begin) holds the radio silent for 6-19s, which was
-             * exceeding the 4s supervision timeout and causing the central
-             * to drop the link mid-erase before OTA_STATUS_READY could be
-             * sent. 20s (0x7D0) is well under the 32s BLE spec max.
-             * Note: these params are a *request* to the central — phones
-             * may honor, defer, or ignore them.
-             *
-             * v4.12.5: interval tightened 40-60ms → 7.5-15ms.
-             * v4.12.8: loosened to 20-30ms with latency=1 — the 7.5-15ms
-             * setting caused average current draw to spike from ~40mA
-             * to ~100mA because the radio wakes 5-10× more frequently.
-             * With dashboard v13.8+ smoothing buffer now absorbing
-             * bursty delivery, we don't need the extreme-low-latency
-             * interval. 20-30ms still gives 3-6× better throughput than
-             * the v4.12.4 settings, and effective wake period (interval
-             * × (latency+1) ≈ 40ms) gives back most of the power.
-             *
-             * BLE conn-event wake duty cycle scaling (ballpark):
-             *   v4.12.4   40-60ms, lat=4  → wake ~every 200ms  → ~40mA
-             *   v4.12.5    7.5-15ms, lat=0 → wake ~every 10ms   → ~100mA
-             *   v4.12.8   20-30ms, lat=1  → wake ~every 40ms   → ~50-60mA */
-            esp_ble_conn_update_params_t conn_params = {
-                .latency = 1,           /* Allow skipping 1 event (power)  */
-                .max_int = 0x18,        /* 30ms max interval */
-                .min_int = 0x10,        /* 20ms min interval */
-                .timeout = 2000,        /* 20 second supervision timeout */
-            };
-            memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-            esp_ble_gap_update_conn_params(&conn_params);
-            break;
-            
-        case ESP_GATTS_DISCONNECT_EVT:
-            is_connected = false;
-            notifications_enabled = false;
-            ppg_notifications_enabled = false;  /* v4.12.0 */
-            ppg_batch_count = 0;                /* v4.14.9: drop any pending batch */
-            ESP_LOGI(TAG, "Client disconnected");
-            
-            /* Cancel OTA if in progress */
-            if (in_ota_mode) {
-                esp_ota_abort(ota_handle);
-                in_ota_mode = false;
-                ESP_LOGW(TAG, "OTA cancelled due to disconnect");
-            }
-            
-            /* Restart advertising with a fresh 60s auto-off window (v4.11.0).
-             * If no reconnect arrives in that window, advertising stops and
-             * device continues standalone until a hall gesture or sleep. */
-            esp_ble_gap_start_advertising(&adv_params);
-            ble_adv_reset_deadline();
-            break;
-            
-        case ESP_GATTS_WRITE_EVT:
-            if (param->write.handle == ctrl_char_handle) {
-                process_command(param->write.value, param->write.len);
-            }
-            else if (param->write.handle == ota_char_handle) {
-                process_ota_data(param->write.value, param->write.len);
-            }
-            else if (param->write.handle == cccd_handle) {
-                if (param->write.len == 2) {
-                    uint16_t cccd_value = param->write.value[0] | (param->write.value[1] << 8);
-                    notifications_enabled = (cccd_value == 0x0001);
-                    ESP_LOGI(TAG, "Status notifications %s", notifications_enabled ? "enabled" : "disabled");
-                    /* v4.12.1: announce firmware on subscribe so the
-                     * dashboard's firmware log immediately shows what
-                     * build is running and which mode we're in. */
-                    if (notifications_enabled) {
-                        ble_log("Narbis fw v%s test=%d mode=%d",
-                                FIRMWARE_VERSION, PPG_TEST_BUILD, (int)led_mode);
-                        /* Refresh fresh dashboard with current relay state.
-                         * The 0xF6 + handles diagnostic that fired during
-                         * boot went into the void (no client). Do it now
-                         * so the header badge + log catch up. */
-                        bool relay_up = narbis_central_is_connected();
-                        uint8_t pkt = relay_up ? 1u : 0u;
-                        send_status_frame(0xF6, &pkt, 1);
-                        ble_log("relay %s (refresh on dashboard connect)",
-                                relay_up ? "linked" : "lost");
-                        narbis_central_emit_diag();
-                    }
-                }
-            }
-            else if (param->write.handle == ppg_cccd_handle) {
-                /* v4.12.0: client subscribing to PPG stream on 0xFF04 */
-                if (param->write.len == 2) {
-                    uint16_t cccd_value = param->write.value[0] | (param->write.value[1] << 8);
-                    ppg_notifications_enabled = (cccd_value == 0x0001);
-                    ESP_LOGI(TAG, "PPG notifications %s", ppg_notifications_enabled ? "enabled" : "disabled");
-                }
-            }
-            
-            /* Send response if needed */
-            if (param->write.need_rsp) {
-                esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
-                                            param->write.trans_id, ESP_GATT_OK, NULL);
-            }
-            break;
-            
-        default:
-            break;
-    }
 }
 
 /*******************************************************************************
@@ -5750,8 +5722,7 @@ static void coh_emit_packet(void) {
     pkt[15] = (uint8_t)((coh_state.lf_hf_fp88 >> 8) & 0xFF);
     pkt[16] = coh_state.n_ibis_used;
     pkt[17] = coh_pacer_current_bpm;  /* v4.14.40: current pacer cycle BPM */
-    esp_err_t err = esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global,
-                                                status_char_handle, sizeof(pkt), pkt, false);
+    esp_err_t err = nimble_notify(status_char_handle, pkt, sizeof(pkt));
     if (err != ESP_OK) ble_send_errors++;
 }
 
@@ -5879,9 +5850,7 @@ static void ppg_batch_flush(void) {
     ppg_batch[5] = (uint8_t)((ppg_batch_base_ts >> 24) & 0xFF);
 
     size_t len = PPG_BATCH_HEADER_BYTES + ppg_batch_count * PPG_BATCH_SAMPLE_BYTES;
-    esp_err_t err = esp_ble_gatts_send_indicate(gatts_if_global, conn_id_global,
-                                                ppg_char_handle, len,
-                                                ppg_batch, false);
+    esp_err_t err = nimble_notify(ppg_char_handle, ppg_batch, len);
     if (err != ESP_OK) ble_send_errors++;
 
     ppg_batch_count = 0;
@@ -6226,39 +6195,18 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     ESP_ERROR_CHECK(ble_stack_init());
 
-    /* Clear any stale BLE bonds left over from older firmware builds that
-     * had CONFIG_BT_BLE_SMP_BOND_NVS_FLASH=y. Existing bonds in Bluedroid's
-     * NVS trigger auto-reconnect to the bonded peer on every boot —
-     * Bluedroid completes MTU / service discovery / CCCD-subscribe
-     * internally using cached service handles and never delivers any of
-     * those events to our gattc_cb. The central state machine ends up
-     * wedged at ST_DISCOVERING with handles 0/0 (c=1 wdc=0 in the chain
-     * diag) while the earclip thinks the link is up and is streaming.
-     * Without this clear, the wedge persists until self-heal fires or
-     * the user 0xC1-forgets. */
-    {
-        int bond_count = esp_ble_get_bond_device_num();
-        if (bond_count > 0) {
-            ESP_LOGW(TAG, "clearing %d stale BLE bond%s",
-                     bond_count, bond_count == 1 ? "" : "s");
-            esp_ble_bond_dev_t *bonds =
-                malloc((size_t)bond_count * sizeof(esp_ble_bond_dev_t));
-            if (bonds != NULL) {
-                esp_ble_get_bond_device_list(&bond_count, bonds);
-                for (int i = 0; i < bond_count; i++) {
-                    esp_ble_remove_bond_device(bonds[i].bd_addr);
-                }
-                free(bonds);
-            } else {
-                ESP_LOGE(TAG, "malloc(bonds) failed — leaving bonds in place");
-            }
-        }
-    }
+    /* NimBLE migration: SMP is not compiled in (CONFIG_BT_NIMBLE_SM_LEGACY=n,
+     * CONFIG_BT_NIMBLE_SM_SC=n) so there are no bonds to clear. The Bluedroid
+     * bond-clear loop that lived here used to mitigate Bluedroid's silent
+     * auto-reconnect / GATTC wedge — that whole pathology is gone with NimBLE.
+     * See NIMBLE_MIGRATION_HANDOFF.md "Bluedroid is dropping events under
+     * dual-role contention" for the original diagnosis. */
 
     /* Path B: bring up the BLE central role on top of the existing
-     * peripheral. Bluedroid is dual-role with CONFIG_BT_BLE_DUAL_ROLE=y
-     * (see sdkconfig.defaults). The central registers a separate gattc
-     * app id and shares the GAP callback with the peripheral. */
+     * peripheral. NimBLE dual-role is enabled via
+     * CONFIG_BT_NIMBLE_ROLE_CENTRAL=y + _PERIPHERAL=y. The central runs
+     * its own per-call event callbacks for scan / connect — no shared
+     * GAP cb forwarding from main.c. */
     {
         esp_err_t cerr = narbis_central_init(on_earclip_ibi, on_earclip_battery);
         if (cerr != ESP_OK) {
