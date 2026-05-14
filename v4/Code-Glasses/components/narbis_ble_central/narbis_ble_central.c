@@ -389,6 +389,14 @@ static void connect_watchdog_cb(void *arg) {
      * covers both the "stuck open" and "actually connected mid-discovery"
      * shapes. */
     (void)esp_ble_gap_disconnect(S.earclip_mac);
+    /* Observed (2026-05-14): after gap_disconnect at watchdog fire,
+     * DISCONNECT_EVT does NOT fire (chain d=0 stays) and the LL link
+     * remains alive from Bluedroid's perspective. The next directed scan
+     * sees hundreds of advs but filters the earclip's own adv out
+     * because Bluedroid considers it "still connected". Clearing the
+     * accept list / RPA list breaks Bluedroid's short-circuit and lets
+     * the next scan see the earclip. */
+    (void)esp_ble_gap_clear_whitelist();
     /* Link is gone from our perspective. Update the dashboard-visible
      * link state so the badge stops showing "Earclip linked". If
      * DISCONNECT_EVT also fires, the redundant emit_state(false) is a
@@ -821,8 +829,20 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         if (mrc != ESP_OK) {
             cb_log("central: send_mtu_req rc=%s", esp_err_to_name(mrc));
         }
-        /* search_service kicks off in CFG_MTU_EVT (textbook order).
-         * If MTU event never arrives, the 15 s watchdog force-recovers. */
+        /* Observed (2026-05-14, log on PR #19): CFG_MTU_EVT does not
+         * fire on this hardware (chain c=1 mtu=0 srch=0 across the wedge
+         * window, then watchdog at 15 s). Kick off search_service now
+         * rather than gating on the dropped MTU event. Search runs fine
+         * at default MTU=23; subsequent larger reads still benefit from
+         * MTU=247 once it's exchanged at the LL layer. */
+        {
+            esp_bt_uuid_t svc = { .len = ESP_UUID_LEN_128 };
+            memcpy(svc.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
+            esp_err_t src = esp_ble_gattc_search_service(gattc_if, S.conn_id, &svc);
+            if (src != ESP_OK) {
+                cb_log("central: search_service rc=%s", esp_err_to_name(src));
+            }
+        }
         break;
     }
 
@@ -847,19 +867,13 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         }
         break;
 
-    case ESP_GATTC_CFG_MTU_EVT: {
+    case ESP_GATTC_CFG_MTU_EVT:
         S.mtus++;
-        cb_log("central: chain 2/9 MTU=%u", p->cfg_mtu.mtu);
-        /* Kick off service discovery now (textbook ordering). If MTU
-         * event never fires the 15 s watchdog force-recovers. */
-        esp_bt_uuid_t svc = { .len = ESP_UUID_LEN_128 };
-        memcpy(svc.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
-        esp_err_t src = esp_ble_gattc_search_service(gattc_if, S.conn_id, &svc);
-        if (src != ESP_OK) {
-            cb_log("central: search_service rc=%s", esp_err_to_name(src));
-        }
+        cb_log("central: chain 2/9 MTU=%u (info-only)", p->cfg_mtu.mtu);
+        /* search_service already kicked off in CONNECT_EVT — see comment
+         * there. This event is informational; the mtus counter tells us
+         * whether the peer's MTU completion got reported back. */
         break;
-    }
 
     case ESP_GATTC_SEARCH_RES_EVT:
         S.searches++;
