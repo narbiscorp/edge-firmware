@@ -69,14 +69,6 @@ static const char *TAG = "narbis_central";
  * doesn't sit through 30 s of staring at a stuck "DISCOVER" state. */
 #define CONNECT_WATCHDOG_MS        15000
 
-/* Cache-driven discovery retry interval. After CONNECT_EVT, Bluedroid
- * may populate its internal GATT cache asynchronously (post-MTU +
- * internal discovery completion). Retrying try_populate_handles_from_cache
- * every CACHE_RETRY_MS catches the window between "cache empty at
- * CONNECT_EVT" and "30 s emit_diag tick" without waiting for the 15 s
- * watchdog to force-disconnect. */
-#define CACHE_RETRY_MS             1000
-
 /* CCCD descriptor UUID (BLE-spec well-known). */
 #define BLE_UUID_CCCD              0x2902
 
@@ -167,16 +159,6 @@ static struct {
     /* esp_timer for the 30 s reconnect backoff. */
     esp_timer_handle_t backoff_timer;
 
-    /* esp_timer for periodic cache-driven discovery retries after
-     * CONNECT_EVT. Bluedroid may populate its internal GATT cache some
-     * milliseconds-to-seconds after CONNECT_EVT (post-MTU + internal
-     * discovery). The 30 s emit_diag self-heal would miss that window
-     * and the 15 s watchdog would force-disconnect first. This timer
-     * fires every CACHE_RETRY_MS to attempt try_populate_handles_from_cache
-     * until either it succeeds (we advance to ST_WRITING_ROLE), the
-     * watchdog fires, or we reach ST_READY. */
-    esp_timer_handle_t cache_retry_timer;
-
     /* esp_timer watchdog for the full connect+discover chain. Armed
      * after every esp_ble_gattc_open() call. If the chain hasn't
      * reached ST_READY within CONNECT_WATCHDOG_MS, fires force-recovery
@@ -221,10 +203,6 @@ static struct {
     uint32_t wd_calls;       /* arm_connect_watchdog() function entries (before NULL check) */
     uint32_t wd_armed;       /* arm_connect_watchdog() reached esp_timer_start_once */
     uint32_t wd_fires;       /* connect_watchdog_cb() fires that passed state guard */
-    uint32_t self_heals;     /* emit_diag self-heal fires (post + pre-discovery) */
-    uint32_t cache_tries;    /* try_populate_handles_from_cache() entries */
-    uint32_t cache_hits;     /* try_populate_handles_from_cache() returned true */
-
     /* When true, the central is paused (e.g. dashboard set HR source to
      * H10 — no need to keep scanning for earclip). Stops scans/backoff
      * timers from running and prevents disconnect-event auto-restart.
@@ -339,11 +317,6 @@ static esp_ble_scan_params_t scan_params = {
     .scan_duplicate     = BLE_SCAN_DUPLICATE_DISABLE,
 };
 
-/* Forward decls for cache retry helpers (used in connect_watchdog_cb +
- * various paths; definitions live just before backoff_timer_cb). */
-static void cancel_cache_retry(void);
-static void arm_cache_retry(void);
-
 static void start_scan_directed(void) {
     /* Cancel any pending backoff so we don't double-fire a scan when
      * the timer expires after we're already scanning. */
@@ -404,7 +377,6 @@ static void connect_watchdog_cb(void *arg) {
         return;
     }
     S.wd_fires++;
-    cancel_cache_retry();
     cb_log("central: connect watchdog %dms in state=%s — force recovery",
            CONNECT_WATCHDOG_MS, state_name(S.state));
     /* Clear any phantom GATTC handle we may be holding. */
@@ -429,39 +401,6 @@ static void connect_watchdog_cb(void *arg) {
      * here is the safety net in case the disconnect was a no-op (no
      * Bluedroid connection to drop). */
     schedule_reconnect_backoff();
-}
-
-/* Forward decls for the cache_retry_timer_cb (defined later in file). */
-static bool try_populate_handles_from_cache(void);
-static void write_peer_role(void);
-
-static void cancel_cache_retry(void) {
-    if (S.cache_retry_timer) esp_timer_stop(S.cache_retry_timer);
-}
-
-static void arm_cache_retry(void) {
-    if (!S.cache_retry_timer) return;
-    esp_timer_stop(S.cache_retry_timer);
-    esp_timer_start_once(S.cache_retry_timer,
-                         (uint64_t)CACHE_RETRY_MS * 1000ULL);
-}
-
-static void cache_retry_timer_cb(void *arg) {
-    (void)arg;
-    /* Stop retrying once we're at READY, in BACKOFF, or in a scan state.
-     * Only retry while we're mid-chain post-CONNECT_EVT but pre-READY. */
-    if (S.state < ST_DISCOVERING || S.state >= ST_READY) {
-        return;
-    }
-    if (try_populate_handles_from_cache()) {
-        cb_log("central: cache retry %dms — got handles, advancing",
-               CACHE_RETRY_MS);
-        write_peer_role();
-        return;
-    }
-    /* Cache still empty — try again next tick. The watchdog will
-     * force-disconnect at 15 s if discovery never completes. */
-    arm_cache_retry();
 }
 
 static void backoff_timer_cb(void *arg) {
@@ -526,7 +465,6 @@ static void advance_to_raw_or_ready(void);
 static void enter_ready(void) {
     S.state = ST_READY;
     cancel_connect_watchdog();
-    cancel_cache_retry();
 
     /* Bluedroid requires register_for_notify to dispatch incoming
      * notifies to gattc_cb. Without it, even a CCCD-enabled peer's
@@ -556,10 +494,10 @@ static void enter_ready(void) {
                                 ESP_GATT_AUTH_REQ_NONE);
     }
 
-    cb_log("central: ready (IBI%s%s%s subscribed)",
-           S.hdl_config_cccd  ? " + config"  : "",
-           S.hdl_battery_cccd ? " + battery" : "",
-           (S.raw_enabled && S.hdl_raw_cccd) ? " + raw" : "");
+    cb_log("central: chain 9/9 READY (IBI%s%s%s)",
+           S.hdl_config_cccd  ? "+cfg"  : "",
+           S.hdl_battery_cccd ? "+batt" : "",
+           (S.raw_enabled && S.hdl_raw_cccd) ? "+raw" : "");
     emit_state(true);
 }
 
@@ -718,52 +656,6 @@ static void cache_handles_after_discover(void) {
            S.hdl_raw, S.hdl_raw_cccd);
 }
 
-/* Try to populate service handles directly from Bluedroid's GATT
- * cache, bypassing the search_service → SEARCH_RES_EVT chain.
- *
- * Background: on the observed Bluedroid stack, SEARCH_RES_EVT is not
- * always delivered to our gattc_cb even when search_service() returns
- * ESP_OK and the underlying GATT exchange completes (chain diag shows
- * c=N d=N srch=0 across multiple cycles). The earclip log
- * independently shows the GATT layer reaching subscribed state, so
- * Bluedroid IS caching the services internally — it's just not
- * pushing the events up to the app.
- *
- * `esp_ble_gattc_get_service` queries that internal cache directly,
- * returning the service's handle range. With that, the existing
- * `cache_handles_after_discover` (which uses cache-based APIs
- * exclusively) can populate hdl_* fields without needing
- * SEARCH_RES_EVT.
- *
- * Returns true if S.hdl_ibi ends up non-zero (we got at least the
- * critical IBI char handle and can proceed to subscribe). */
-static bool try_populate_handles_from_cache(void) {
-    S.cache_tries++;
-    if (S.hdl_ibi != 0) {
-        S.cache_hits++;
-        return true;  /* already populated by a real SEARCH_RES_EVT path */
-    }
-    esp_bt_uuid_t svc_uuid = { .len = ESP_UUID_LEN_128 };
-    memcpy(svc_uuid.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
-    uint16_t svc_count = 1;
-    esp_gattc_service_elem_t svc_elem;
-    esp_gatt_status_t st = esp_ble_gattc_get_service(
-        S.gattc_if, S.conn_id, &svc_uuid, &svc_elem, &svc_count, 0);
-    if (st != ESP_GATT_OK || svc_count == 0) {
-        return false;
-    }
-    S.svc_start_handle = svc_elem.start_handle;
-    S.svc_end_handle   = svc_elem.end_handle;
-    cb_log("central: service from cache %u..%u (bypass SEARCH_RES_EVT)",
-           S.svc_start_handle, S.svc_end_handle);
-    cache_handles_after_discover();
-    if (S.hdl_ibi != 0) {
-        S.cache_hits++;
-        return true;
-    }
-    return false;
-}
-
 static void write_peer_role(void) {
     if (S.hdl_peer_role == 0) {
         ESP_LOGW(TAG, "no peer-role char; earclip is older firmware");
@@ -903,24 +795,19 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         break;
 
     case ESP_GATTC_CONNECT_EVT: {
-        /* Capture the previous state for diagnostics. With SMP enabled in
-         * sdkconfig (CONFIG_BT_BLE_SMP_ENABLE=y, CONFIG_BT_BLE_SMP_BOND_NVS_FLASH=y),
-         * Bluedroid can produce CONNECT_EVT from a bonded-peer auto-reconnect
-         * without us ever calling gattc_open() — our state would still be
-         * ST_SCANNING_DIRECTED / ST_SCANNING_GENERAL / ST_BACKOFF in that
-         * case, and the watchdog wouldn't have been armed by the scan-
-         * result handler. That's the c=1 / wdc=0 wedge shape we've been
-         * seeing. Arm the watchdog HERE unconditionally so the chain is
-         * covered regardless of who initiated the connect. */
+        /* PR #11: arm the watchdog HERE unconditionally as well as in the
+         * scan handler — covers the bonded-peer auto-reconnect path where
+         * Bluedroid produces CONNECT_EVT without us calling gattc_open().
+         * Harmless if scan handler already armed; esp_timer_start_once
+         * resets the timer. */
         central_state_t prev_state = S.state;
         if (S.backoff_timer) esp_timer_stop(S.backoff_timer);
         S.conn_id = p->connect.conn_id;
         S.last_seen_us = esp_timer_get_time();
-        /* If we were already at READY before this CONNECT_EVT, Bluedroid
-         * silently re-cycled the link (no DISCONNECT_EVT to our cb). Reset
-         * the emit_state dedup so the next emit_state(true) from enter_ready
-         * actually fires; otherwise the dashboard badge stays stuck at the
-         * stale value. */
+        /* PR #14: if we were already at READY before this CONNECT_EVT,
+         * Bluedroid silently re-cycled the link (no DISCONNECT_EVT to
+         * our cb). Reset the emit_state dedup so the next emit_state(true)
+         * actually fires; otherwise the dashboard badge stays stuck. */
         if (prev_state == ST_READY) {
             emit_state(false);
         }
@@ -928,56 +815,14 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.connects++;
         S.peer_connected = true;
         arm_connect_watchdog();
-        /* Defense-in-depth: invalidate any Bluedroid GATT cache for this
-         * peer before doing MTU + search_service. If Bluedroid auto-
-         * reconnected from a cached prior session, the cache may have
-         * stale handles and search_service will short-circuit with no
-         * SEARCH_RES_EVT. cache_refresh forces a fresh discovery on the
-         * link we just established. Pair with the cache_clean at boot
-         * in narbis_central_start. */
-        (void)esp_ble_gattc_cache_refresh(p->connect.remote_bda);
-        cb_log("central: connected, conn_id=%u (was %s)",
+        cb_log("central: chain 1/9 CONNECT conn_id=%u (was %s)",
                (unsigned)S.conn_id, state_name(prev_state));
-        /* Negotiate larger MTU; the peripheral may decline and we fall
-         * back to default 23. Don't gate further progress on CFG_MTU_EVT
-         * — observed Bluedroid quirk where the peer initiates MTU first
-         * and CFG_MTU_EVT never fires for our app-layer request. The
-         * earclip's NimBLE side completes MTU=247 fine, but we'd sit
-         * forever waiting for the EVT and the chain would never advance
-         * (chain c=N d=N mtu=0 srch=0 across multiple cycles). */
         esp_err_t mrc = esp_ble_gattc_send_mtu_req(gattc_if, S.conn_id);
         if (mrc != ESP_OK) {
             cb_log("central: send_mtu_req rc=%s", esp_err_to_name(mrc));
         }
-        /* Kick off service discovery immediately rather than waiting
-         * for CFG_MTU_EVT. Search runs fine at the default MTU (23 B);
-         * subsequent larger characteristic reads still benefit from
-         * MTU=247 once it's exchanged at the LL layer (Bluedroid
-         * handles this transparently). */
-        {
-            esp_bt_uuid_t svc = { .len = ESP_UUID_LEN_128 };
-            memcpy(svc.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
-            esp_err_t src = esp_ble_gattc_search_service(gattc_if, S.conn_id, &svc);
-            if (src != ESP_OK) {
-                cb_log("central: search_service rc=%s", esp_err_to_name(src));
-            }
-        }
-        /* Bypass attempt: if Bluedroid has the service cached from a
-         * prior session, we can populate handles directly without
-         * waiting for SEARCH_RES_EVT to fire. Likely to fail this early
-         * (the cache is populated by Bluedroid AFTER the GATT exchange
-         * completes), but cheap to try. The emit_diag pre-discovery
-         * self-heal will retry later if this returns false. */
-        if (try_populate_handles_from_cache()) {
-            write_peer_role();
-        } else {
-            /* Cache empty at CONNECT_EVT time. Start the cache retry
-             * timer to poll every CACHE_RETRY_MS — Bluedroid may
-             * populate the cache after internal discovery completes,
-             * possibly seconds later but before the 15 s watchdog or
-             * 30 s emit_diag tick. */
-            arm_cache_retry();
-        }
+        /* search_service kicks off in CFG_MTU_EVT (textbook order).
+         * If MTU event never arrives, the 15 s watchdog force-recovers. */
         break;
     }
 
@@ -1002,31 +847,35 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         }
         break;
 
-    case ESP_GATTC_CFG_MTU_EVT:
+    case ESP_GATTC_CFG_MTU_EVT: {
         S.mtus++;
-        ESP_LOGI(TAG, "central: mtu=%u", p->cfg_mtu.mtu);
-        /* Note: search_service was already kicked off from CONNECT_EVT
-         * — we no longer gate discovery on this event arriving, because
-         * Bluedroid sometimes never delivers it (peer-initiated MTU
-         * exchange or version quirks). This event is now purely
-         * informational; the mtu counter in the chain diag tells us
-         * whether MTU completion was reported back to us. */
+        cb_log("central: chain 2/9 MTU=%u", p->cfg_mtu.mtu);
+        /* Kick off service discovery now (textbook ordering). If MTU
+         * event never fires the 15 s watchdog force-recovers. */
+        esp_bt_uuid_t svc = { .len = ESP_UUID_LEN_128 };
+        memcpy(svc.uuid.uuid128, NARBIS_SVC_UUID_LE, 16);
+        esp_err_t src = esp_ble_gattc_search_service(gattc_if, S.conn_id, &svc);
+        if (src != ESP_OK) {
+            cb_log("central: search_service rc=%s", esp_err_to_name(src));
+        }
         break;
+    }
 
     case ESP_GATTC_SEARCH_RES_EVT:
         S.searches++;
         S.svc_start_handle = p->search_res.start_handle;
         S.svc_end_handle   = p->search_res.end_handle;
-        ESP_LOGI(TAG, "central: svc handles %u..%u",
-                 S.svc_start_handle, S.svc_end_handle);
+        cb_log("central: chain 3/9 SEARCH_RES %u..%u",
+               S.svc_start_handle, S.svc_end_handle);
         break;
 
     case ESP_GATTC_SEARCH_CMPL_EVT:
         if (S.svc_start_handle == 0) {
-            ESP_LOGW(TAG, "central: NARBIS service not found on peer");
+            cb_log("central: chain 4/9 SEARCH_CMPL svc-not-found");
             esp_ble_gattc_close(gattc_if, S.conn_id);
             break;
         }
+        cb_log("central: chain 4/9 SEARCH_CMPL ok");
         cache_handles_after_discover();
         write_peer_role();
         break;
@@ -1036,6 +885,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
          * machine. Runtime config-write completions (CONFIG_WRITE while
          * in ST_READY) reach this event too — guard so they don't reset. */
         if (S.state == ST_WRITING_ROLE) {
+            cb_log("central: chain 5/9 WRITE_ROLE_ACK");
             S.state = ST_SUBSCRIBING_IBI;
             if (S.hdl_ibi_cccd) cccd_subscribe(S.hdl_ibi_cccd);
             else { ESP_LOGW(TAG, "no IBI CCCD; skipping"); enter_ready(); }
@@ -1044,10 +894,13 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
 
     case ESP_GATTC_WRITE_DESCR_EVT:
         if (S.state == ST_SUBSCRIBING_IBI) {
+            cb_log("central: chain 6/9 SUB_IBI_ACK");
             advance_to_config_or_batt_or_raw_or_ready();
         } else if (S.state == ST_SUBSCRIBING_CONFIG) {
+            cb_log("central: chain 7/9 SUB_CFG_ACK");
             read_config_initial();
         } else if (S.state == ST_SUBSCRIBING_BATT) {
+            cb_log("central: chain 8/9 SUB_BATT_ACK");
             advance_to_raw_or_ready();
         } else if (S.state == ST_SUBSCRIBING_RAW) {
             enter_ready();
@@ -1127,7 +980,6 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         S.peer_connected = false;
         cb_log("central: disconnected reason=%d", p->disconnect.reason);
         cancel_connect_watchdog();
-        cancel_cache_retry();
         emit_state(false);
         /* Unregister all per-char notify registrations so they don't
          * pile up in Bluedroid's internal table (default cap of 5
@@ -1202,12 +1054,6 @@ esp_err_t narbis_central_init(narbis_central_ibi_cb_t     ibi_cb,
     };
     if ((err = esp_timer_create(&wargs, &S.connect_watchdog)) != ESP_OK) return err;
 
-    const esp_timer_create_args_t crargs = {
-        .callback = cache_retry_timer_cb,
-        .name = "narbis_central_cache_retry",
-    };
-    if ((err = esp_timer_create(&crargs, &S.cache_retry_timer)) != ESP_OK) return err;
-
     ESP_LOGI(TAG, "central init ok");
     return ESP_OK;
 }
@@ -1226,35 +1072,6 @@ esp_err_t narbis_central_start(void) {
         S.earclip_known = true;
         ESP_LOGI(TAG, "central: NVS earclip %02x:%02x:%02x:%02x:%02x:%02x",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        /* Wipe any Bluedroid-cached GATT service info for this peer.
-         * Bluedroid persists service caches (sometimes implicitly,
-         * especially when bonding was previously enabled) and on next
-         * connect will short-circuit search_service — firing
-         * SEARCH_CMPL_EVT with no SEARCH_RES_EVT in between. The central
-         * sees svc_start_handle=0, logs "service not found", calls
-         * gattc_close, then re-cycles. d=0 c=2 srch=0 in chain diag.
-         * Cleaning the cache forces a fresh over-the-air discovery on
-         * the next connect, which actually produces SEARCH_RES_EVT and
-         * lets us cache real handles. */
-        esp_err_t cc = esp_ble_gattc_cache_clean(S.earclip_mac);
-        ESP_LOGI(TAG, "central: cache_clean rc=%s", esp_err_to_name(cc));
-        /* Pre-emptive disconnect of any Bluedroid-side persistent link to
-         * the saved peer. Symptom: c=1 with wdc=1 (only the CONNECT_EVT-
-         * level arm fired) means the connection came from Bluedroid auto-
-         * reconnect, bypassing our scan handler. After our watchdog/self-
-         * heal "force-disconnect" the BLE link sometimes stays alive at
-         * the controller level (no DISCONNECT_EVT, d=0 in chain) — the
-         * earclip's LED keeps showing connected and our directed scan
-         * sees no matching adv ("757 adv seen, target not found") because
-         * Bluedroid filters out advs from peers it considers connected.
-         * Calling gap_disconnect on the saved MAC here knocks the stale
-         * link loose so our scan actually sees the earclip's adv. The
-         * second call clears the accept list / RPA list — Bluedroid uses
-         * these to short-circuit reconnects without us asking. */
-        (void)esp_ble_gap_disconnect(S.earclip_mac);
-        esp_err_t wl = esp_ble_gap_clear_whitelist();
-        ESP_LOGI(TAG, "central: pre-scan disconnect + clear_whitelist rc=%s",
-                 esp_err_to_name(wl));
         start_scan_directed();
     } else {
         S.earclip_known = false;
@@ -1268,7 +1085,6 @@ esp_err_t narbis_central_stop(void) {
     ESP_LOGI(TAG, "central: stop (HR source switched away from earclip)");
     S.paused = true;
     cancel_connect_watchdog();
-    cancel_cache_retry();
     S.peer_connected = false;
     emit_state(false);
     /* Close any active connection; the DISCONNECT_EVT handler sees
@@ -1292,7 +1108,6 @@ esp_err_t narbis_central_stop(void) {
 esp_err_t narbis_central_forget(void) {
     ESP_LOGW(TAG, "central: forget paired earclip");
     cancel_connect_watchdog();
-    cancel_cache_retry();
     S.peer_connected = false;
     emit_state(false);
     if (S.conn_id) {
@@ -1393,73 +1208,16 @@ void narbis_central_emit_diag(void) {
            (unsigned)S.notify_ibi_count, (unsigned)S.notify_config_count,
            (unsigned)S.notify_batt_count, (unsigned)S.notify_raw_count,
            (unsigned)S.notify_diag_count, (unsigned)S.notify_other_count);
-    /* Chain progress: pairs with the relay state= line to localize wedges
-     * that happen before the dashboard subscribes (one-shot CONNECT/MTU/
-     * SEARCH events otherwise leave no BLE-visible trace). wd_ok=0 means
-     * S.connect_watchdog is NULL — the timer-based watchdog is disabled
-     * (likely esp_timer_create failed at init) and any wedge in
-     * CONNECTING/DISCOVERING is unrecoverable without the self-heal
-     * fallback below. sh = self-heal fires since boot. */
-    cb_log("chain c=%u d=%u mtu=%u srch=%u wdc=%u wda=%u wdf=%u wd_ok=%d sh=%u ct=%u ch=%u",
+    /* Chain progress counters — pairs with the relay state= line above to
+     * localize wedges that happen before the dashboard subscribes (the
+     * one-shot CONNECT/MTU/SEARCH events otherwise leave no BLE-visible
+     * trace). wd_ok=0 means S.connect_watchdog is NULL — the timer-based
+     * watchdog is disabled (likely esp_timer_create failed at init). */
+    cb_log("chain c=%u d=%u mtu=%u srch=%u wdc=%u wda=%u wdf=%u wd_ok=%d",
            (unsigned)S.connects, (unsigned)S.disconnects,
            (unsigned)S.mtus, (unsigned)S.searches,
            (unsigned)S.wd_calls, (unsigned)S.wd_armed, (unsigned)S.wd_fires,
-           S.connect_watchdog ? 1 : 0,
-           (unsigned)S.self_heals,
-           (unsigned)S.cache_tries, (unsigned)S.cache_hits);
-    /* Self-heal: handles cached but chain didn't reach READY — force the
-     * transition (idempotent re-register + CCCD writes inside enter_ready
-     * actually start data flow). Doesn't gate on S.conn_id because
-     * Bluedroid can legitimately assign conn_id=0; state >= ST_WRITING_ROLE
-     * already implies we're connected (handles are only cached after
-     * SEARCH_CMPL_EVT). */
-    if (S.state >= ST_WRITING_ROLE && S.state < ST_READY && S.hdl_ibi != 0) {
-        S.self_heals++;
-        cb_log("self-heal: handles cached state=%s — forcing READY",
-               state_name(S.state));
-        enter_ready();
-    }
-    /* Pre-discovery wedge fallback: post-CONNECT_EVT but no handles cached
-     * yet (MTU exchange or service discovery never completed). Same shape
-     * as PR #6's timer-based watchdog, but driven by the diag tick so it
-     * still recovers when wd_ok=0 or the timer somehow isn't arming. Gate
-     * on >15 s elapsed since CONNECT_EVT (S.last_seen_us is set at line
-     * ~763) so we don't race a legitimate in-flight discovery. emit_diag
-     * runs at dashboard-connect AND on the ~30 s periodic alive log, so
-     * worst-case recovery time is ~45 s after the wedge starts.
-     * No conn_id != 0 check — Bluedroid can legitimately assign conn_id=0,
-     * and state == ST_DISCOVERING is only reachable via the CONNECT_EVT
-     * handler so we know there's an active link. */
-    else if (S.state >= ST_DISCOVERING && S.state < ST_READY &&
-             S.hdl_ibi == 0 &&
-             S.last_seen_us != 0 &&
-             (esp_timer_get_time() - S.last_seen_us) > (int64_t)CONNECT_WATCHDOG_MS * 1000LL) {
-        int64_t elapsed_ms = (esp_timer_get_time() - S.last_seen_us) / 1000;
-        /* Before force-disconnecting, try the cache-driven bypass:
-         * Bluedroid often has the services cached internally even when
-         * it doesn't fire SEARCH_RES_EVT. If we can read the handles
-         * from the cache, populate them and advance the chain instead
-         * of throwing the link away. */
-        if (try_populate_handles_from_cache()) {
-            S.self_heals++;
-            cb_log("self-heal: pre-discovery wedge (%lld ms, state=%s) — recovered via cache, advancing",
-                   (long long)elapsed_ms, state_name(S.state));
-            write_peer_role();
-            return;
-        }
-        /* Cache didn't have it either — really wedged. Force-disconnect
-         * and let the scan + reconnect path try again. */
-        S.self_heals++;
-        cb_log("self-heal: pre-discovery wedge (%lld ms, state=%s conn_id=%u) — force-disconnect (cache empty)",
-               (long long)elapsed_ms, state_name(S.state), (unsigned)S.conn_id);
-        cancel_cache_retry();
-        (void)esp_ble_gattc_close(S.gattc_if, S.conn_id);
-        S.conn_id = 0;
-        (void)esp_ble_gap_disconnect(S.earclip_mac);
-        S.peer_connected = false;
-        emit_state(false);
-        schedule_reconnect_backoff();
-    }
+           S.connect_watchdog ? 1 : 0);
 }
 
 esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len) {
