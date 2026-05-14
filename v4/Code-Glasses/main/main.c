@@ -1529,7 +1529,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.1-diag"
+#define FIRMWARE_VERSION "4.15.2-ibi-relay"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -6011,6 +6011,20 @@ static void ppg_task(void *arg) {
 
 static void on_earclip_ibi(uint16_t ibi_ms, uint8_t conf, uint8_t flags) {
     ble_log("earclip ibi=%u conf=%u flags=0x%02x", ibi_ms, conf, flags);
+    /* Structured pass-through: 4-byte payload mirroring the earclip's
+     * narbis_ibi_payload_t shape (ibi_ms u16 LE, conf u8, flags u8). The
+     * dashboard's 0xF9 parser feeds this into the same `relayedIbi` event
+     * the 0xF1 regex parser uses, but at ~6x lower airtime and one event
+     * vs string parsing — better behavior under marginal-link contention.
+     * Emitted before the confidence gate so the dashboard sees every beat
+     * with its flags, matching the 0xF1 log line above (which also fires
+     * unconditionally). */
+    uint8_t ibi_pkt[4];
+    ibi_pkt[0] = (uint8_t)(ibi_ms & 0xFF);
+    ibi_pkt[1] = (uint8_t)((ibi_ms >> 8) & 0xFF);
+    ibi_pkt[2] = conf;
+    ibi_pkt[3] = flags;
+    send_status_frame(0xF9, ibi_pkt, sizeof(ibi_pkt));
     /* Earclip is now the sole beat source — wire to the same downstream
      * consumers the old internal ppg_detect used to feed:
      *   1. LED_MODE_PULSE_ON_BEAT — flash lens once per beat
