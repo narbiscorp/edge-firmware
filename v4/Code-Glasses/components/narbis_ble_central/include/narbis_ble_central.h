@@ -133,6 +133,27 @@ esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len);
  * the discovery / ready logs that fired into the void at boot. */
 void narbis_central_emit_diag(void);
 
+/* On-demand re-issue of the one-shot CONFIG read. enter_ready() does
+ * this once at step 7 of the chain (read_config_initial), but if NimBLE's
+ * outbound queue was congested at that moment — or the BATCHED profile's
+ * supervision timer happened to fire during the read window — the result
+ * can be dropped and the dashboard never receives its initial 0xF4 frame,
+ * leaving the ConfigPanel stuck on "Loading config from earclip…".
+ *
+ * The dashboard sends 0xC5 on relay-up if config is still null after a
+ * short delay, and exposes a manual "reload from earclip" button. This
+ * function is what 0xC5 dispatches to. Idempotent — safe to call from
+ * any task. Allows the call as long as the conn handle and S.hdl_config
+ * are populated; the state-machine's read_config_initial advance only
+ * fires when state == ST_READING_CONFIG_INITIAL, so calling this in
+ * ST_READY just dispatches the result through S.config_cb without
+ * touching state.
+ *
+ * Returns ESP_ERR_INVALID_STATE if not connected or the CONFIG handle
+ * was never discovered (older earclip firmware), otherwise the rc from
+ * ble_gattc_read (0 = queued for transmission). */
+esp_err_t narbis_central_request_config_read(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1267,3 +1267,19 @@ esp_err_t narbis_central_write_earclip_config(const uint8_t *bytes, size_t len) 
     cb_log("central: config write dispatch rc=%d (%u B)", rc, (unsigned)len);
     return (rc == 0) ? ESP_OK : ESP_FAIL;
 }
+
+esp_err_t narbis_central_request_config_read(void) {
+    /* Need an active connection and a discovered CONFIG handle — both
+     * are populated by the discovery chain. State doesn't need to be
+     * exactly ST_READY: on_config_read dispatches the payload through
+     * S.config_cb regardless of state, and only advances the state
+     * machine when ST_READING_CONFIG_INITIAL is in flight. A 0xC5 fired
+     * from the dashboard in ST_READY just re-reads and re-relays the
+     * current config blob; the state machine is unaffected. */
+    if (S.conn_handle == CONN_HANDLE_NONE || S.hdl_config == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    int rc = ble_gattc_read(S.conn_handle, S.hdl_config, on_config_read, NULL);
+    cb_log("central: config re-read dispatch rc=%d", rc);
+    return (rc == 0) ? ESP_OK : ESP_FAIL;
+}

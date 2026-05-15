@@ -4318,6 +4318,23 @@ static void process_command(uint8_t *data, uint16_t len) {
             break;
         }
 
+        case 0xC5: {  /* Path B Phase 1: dashboard requests a fresh CONFIG
+                       * read from the earclip. Sent automatically by the
+                       * dashboard when the relay goes UP but no 0xF4 frame
+                       * arrived within ~2 s (the one-shot read inside
+                       * read_config_initial at chain step 7 was dropped),
+                       * and exposed as a manual "reload from earclip"
+                       * button in ConfigPanel. arg ignored.
+                       *
+                       * The earclip's CONFIG characteristic responds with
+                       * its 50-byte payload, on_config_read fires the
+                       * S.config_cb (= on_earclip_config in main), which
+                       * sends a 0xF4 frame to the dashboard. */
+            esp_err_t err = narbis_central_request_config_read();
+            ble_log("0xC5 config refresh rc=%d", err);
+            break;
+        }
+
         case 0xCB:  /* Set HR source. Tells the BLE central to scan/connect
                      * to the earclip (default) or pause entirely (the
                      * dashboard is forwarding H10 R-R intervals via 0xCA).
