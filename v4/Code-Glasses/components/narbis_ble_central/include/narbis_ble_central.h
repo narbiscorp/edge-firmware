@@ -57,6 +57,9 @@ bool      narbis_central_is_connected(void);
  * (BLE_HS_CONN_HANDLE_NONE) if no link. Lets main.c call ble_gap_conn_rssi
  * etc. for the central side without exposing the rest of S. */
 uint16_t  narbis_central_get_conn_handle(void);
+/* Current negotiated PHY on the earclip link (1=1M, 2=2M). Returns 1
+ * before the first PHY_UPDATE_COMPLETE fires or after disconnect. */
+uint8_t   narbis_central_get_phy(void);
 
 /* Optional log sink. When registered, the central forwards its key
  * scan/connect/subscribe/disconnect events to this function in addition

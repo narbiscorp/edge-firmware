@@ -2547,6 +2547,7 @@ static TaskHandle_t ota_task_handle = NULL;
 static uint16_t status_char_handle = 0;            /* 0xFF03 val_handle */
 static uint16_t ppg_char_handle    = 0;            /* 0xFF04 val_handle */
 static uint16_t g_conn_handle      = 0xFFFF;       /* dashboard conn_handle */
+static uint8_t  g_dash_phy         = 1;            /* negotiated PHY on dashboard link (1=1M, 2=2M) */
 static uint8_t  g_own_addr_type    = 0;            /* set in on_ble_sync */
 static bool notifications_enabled  = false;        /* Status notifications (0xFF03) */
 static bool ppg_notifications_enabled = false;     /* v4.12.0: PPG notifications (0xFF04) */
@@ -3251,7 +3252,7 @@ static void emit_link_quality(void) {
     uint16_t mtu = (g_conn_handle != 0xFFFF) ? ble_att_mtu(g_conn_handle) : 0;
     uint16_t drops16 = (ble_send_errors > 0xFFFF) ? 0xFFFF : (uint16_t)ble_send_errors;
 
-    uint8_t pkt[7];
+    uint8_t pkt[9];
     pkt[0] = 0xFA;
     pkt[1] = (uint8_t)ec_rssi;
     pkt[2] = (uint8_t)dash_rssi;
@@ -3259,6 +3260,8 @@ static void emit_link_quality(void) {
     pkt[4] = (uint8_t)((mtu >> 8) & 0xFF);
     pkt[5] = (uint8_t)(drops16 & 0xFF);
     pkt[6] = (uint8_t)((drops16 >> 8) & 0xFF);
+    pkt[7] = narbis_central_get_phy();   /* earclip link PHY: 1=1M 2=2M */
+    pkt[8] = g_dash_phy;                 /* dashboard link PHY: 1=1M 2=2M */
     nimble_notify(status_char_handle, pkt, sizeof(pkt));
 }
 
@@ -4719,11 +4722,20 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
             };
             int rc = ble_gap_update_params(g_conn_handle, &upd);
             if (rc != 0) ESP_LOGW(TAG, "conn_update_params: %d", rc);
+            g_dash_phy = 1; /* reset; PHY_UPDATE_COMPLETE will correct it */
         } else {
             ESP_LOGW(TAG, "Connect failed status=%d, restart adv",
                      event->connect.status);
             start_advertising();
         }
+        return 0;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        g_dash_phy = event->phy_updated.tx_phy;
+        ESP_LOGI(TAG, "peripheral phy update conn=%d tx=%d rx=%d status=%d",
+                 event->phy_updated.conn_handle,
+                 event->phy_updated.tx_phy, event->phy_updated.rx_phy,
+                 event->phy_updated.status);
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:

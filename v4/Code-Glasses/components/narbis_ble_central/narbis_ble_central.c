@@ -204,6 +204,12 @@ static struct {
     bool paused;
 } S;
 
+/* Current negotiated PHY on the earclip link (NimBLE value: 1=1M, 2=2M).
+ * Updated in BLE_GAP_EVENT_PHY_UPDATE_COMPLETE; reset to 1M on disconnect.
+ * Read by narbis_central_get_phy() so emit_link_quality() can include it
+ * in the 0xFA frame without exposing S internals. */
+static uint8_t s_central_phy = 1;
+
 /* Forward decls — many of these reference each other in the chain. */
 static int  gap_event_cb(struct ble_gap_event *event, void *arg);
 static const char *state_name(central_state_t s);
@@ -925,6 +931,14 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         }
         return 0;
 
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        s_central_phy = event->phy_updated.tx_phy;
+        cb_log("central: phy update conn=%u tx=%d rx=%d status=%d",
+               (unsigned)event->phy_updated.conn_handle,
+               event->phy_updated.tx_phy, event->phy_updated.rx_phy,
+               event->phy_updated.status);
+        return 0;
+
     case BLE_GAP_EVENT_DISCONNECT:
         S.disconnects++;
         S.peer_connected = false;
@@ -933,6 +947,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         cancel_connect_watchdog();
         emit_state(false);
         S.conn_handle = CONN_HANDLE_NONE;
+        s_central_phy = 1;
         S.svc_start_handle = S.svc_end_handle = 0;
         S.hdl_ibi = S.hdl_ibi_cccd = 0;
         S.hdl_battery = S.hdl_battery_cccd = 0;
@@ -1161,6 +1176,10 @@ uint16_t narbis_central_get_conn_handle(void) {
     /* Read-only view of S.conn_handle so callers can pass it to
      * ble_gap_conn_rssi() without poking module internals. */
     return S.conn_handle;
+}
+
+uint8_t narbis_central_get_phy(void) {
+    return s_central_phy;
 }
 
 void narbis_central_set_config_cb(narbis_central_config_cb_t cb) {
