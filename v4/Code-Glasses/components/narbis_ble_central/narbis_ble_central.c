@@ -633,12 +633,22 @@ static int on_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *err,
         if (ble_uuid_cmp(&dsc->uuid.u, &UUID_CCCD.u) == 0) {
             /* Find which char this CCCD belongs to. NimBLE's dsc disc
              * walks ascending; the owning char is the one whose
-             * [val_handle+1, next_chr_handle-1] range contains dsc->handle. */
+             * [val_handle+1, next_chr_handle-1] range contains dsc->handle.
+             *
+             * Guard against overwrite: if an unsubscribed notify char sits
+             * in the gap between two subscribed targets (concrete example:
+             * the earclip exposes IBI, SQI, RAW... and we don't track SQI),
+             * SQI's CCCD falls inside IBI's range and would clobber IBI's
+             * real CCCD (which was just assigned on the prior dsc cb).
+             * Per BLE spec the CCCD comes immediately after the val handle,
+             * so the FIRST CCCD seen in any target's range is the right one. */
             for (int i = 0; i < S.dsc_target_count; i++) {
                 uint16_t lo = (uint16_t)(*S.dsc_targets[i].val_handle + 1);
                 uint16_t hi = (uint16_t)(S.dsc_targets[i].next_chr_handle - 1);
                 if (dsc->handle >= lo && dsc->handle <= hi) {
-                    *S.dsc_targets[i].cccd_handle = dsc->handle;
+                    if (*S.dsc_targets[i].cccd_handle == 0) {
+                        *S.dsc_targets[i].cccd_handle = dsc->handle;
+                    }
                     break;
                 }
             }
