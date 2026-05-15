@@ -4374,7 +4374,16 @@ static void process_command(uint8_t *data, uint16_t len) {
             if (conf < g_coh_params.conf_threshold || (flags & NARBIS_BEAT_FLAG_ARTIFACT)) break;
             beat_pulse_start_tick = xTaskGetTickCount();  /* Program 1 flash */
             uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-            if (ibi_ms > 0) coh_push_ibi(now_ms, ibi_ms);
+            if (ibi_ms > 0) {
+                if (g_ibi_rolling_avg_ms == 0) {
+                    g_ibi_rolling_avg_ms = ibi_ms;
+                } else if (ibi_ms > g_ibi_rolling_avg_ms * (100u + IBI_OUTLIER_THRESHOLD_PCT) / 100u) {
+                    break;  /* likely missed beat; coherence ring skipped */
+                } else {
+                    g_ibi_rolling_avg_ms = (g_ibi_rolling_avg_ms * 7u + ibi_ms) / 8u;
+                }
+                coh_push_ibi(now_ms, ibi_ms);
+            }
             break;
         }
 
@@ -5401,6 +5410,7 @@ static bool ppg_detect(float filtered, uint32_t time_ms) {
  ******************************************************************************/
 
 #define COH_IBI_RING_SIZE     120   /* ~2 min at 60 bpm */
+#define IBI_OUTLIER_THRESHOLD_PCT  75u  /* reject IBI > avg × 1.75; catches missed-beat doubles */
 #define COH_GRID_N            256   /* FFT size, power of 2 */
 #define COH_GRID_HZ           4.0f  /* Resample rate (standard for HRV analysis) */
 #define COH_WINDOW_S          (COH_GRID_N / COH_GRID_HZ)  /* 64 seconds */
@@ -5426,6 +5436,7 @@ static coh_ibi_entry_t coh_ibi_ring[COH_IBI_RING_SIZE];
 static uint8_t coh_ibi_head = 0;        /* where next push goes */
 static uint8_t coh_ibi_count = 0;       /* how many valid entries (caps at ring size) */
 static portMUX_TYPE coh_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t g_ibi_rolling_avg_ms = 0;  /* IIR; 0 = uninitialized. Reset on earclip disconnect. */
 
 /* Push a beat into the ring. Called from ppg_task on every detected beat. */
 static void coh_push_ibi(uint32_t beat_ms, uint16_t ibi_ms) {
@@ -6118,6 +6129,13 @@ static void on_earclip_ibi(uint16_t ibi_ms, uint8_t conf, uint8_t flags) {
     beat_pulse_start_tick = xTaskGetTickCount();
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     if (ibi_ms > 0) {
+        if (g_ibi_rolling_avg_ms == 0) {
+            g_ibi_rolling_avg_ms = ibi_ms;
+        } else if (ibi_ms > g_ibi_rolling_avg_ms * (100u + IBI_OUTLIER_THRESHOLD_PCT) / 100u) {
+            return;  /* likely missed beat; LED already pulsed, coherence ring skipped */
+        } else {
+            g_ibi_rolling_avg_ms = (g_ibi_rolling_avg_ms * 7u + ibi_ms) / 8u;
+        }
         coh_push_ibi(now_ms, ibi_ms);
     }
 }
@@ -6180,6 +6198,7 @@ static void on_central_state(bool connected) {
         indicator_trigger(3, 0);      /* 3 slow pulses, no hold */
     } else {
         indicator_trigger(2, 0);      /* 2 fast pulses */
+        g_ibi_rolling_avg_ms = 0;    /* reset outlier filter so stale avg doesn't corrupt reconnect */
     }
 }
 
