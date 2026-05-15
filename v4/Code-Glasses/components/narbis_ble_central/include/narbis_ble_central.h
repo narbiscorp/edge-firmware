@@ -53,6 +53,11 @@ esp_err_t narbis_central_forget(void);
 
 bool      narbis_central_is_connected(void);
 
+/* Current NimBLE conn_handle for the earclip link, or 0xFFFF
+ * (BLE_HS_CONN_HANDLE_NONE) if no link. Lets main.c call ble_gap_conn_rssi
+ * etc. for the central side without exposing the rest of S. */
+uint16_t  narbis_central_get_conn_handle(void);
+
 /* Optional log sink. When registered, the central forwards its key
  * scan/connect/subscribe/disconnect events to this function in addition
  * to ESP_LOG. main.c registers its existing ble_log() here so dashboard

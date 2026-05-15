@@ -1157,6 +1157,12 @@ bool narbis_central_is_connected(void) {
     return S.peer_connected;
 }
 
+uint16_t narbis_central_get_conn_handle(void) {
+    /* Read-only view of S.conn_handle so callers can pass it to
+     * ble_gap_conn_rssi() without poking module internals. */
+    return S.conn_handle;
+}
+
 void narbis_central_set_config_cb(narbis_central_config_cb_t cb) {
     S.config_cb = cb;
 }

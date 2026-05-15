@@ -1529,7 +1529,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.2-ibi-relay"
+#define FIRMWARE_VERSION "4.15.3-link-quality"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -3212,6 +3212,53 @@ static void ppg_emit_health(void) {
     pkt[18] = (uint8_t)((jit_max16 >> 8) & 0xFF);
     pkt[19] = jit_over8;
 
+    nimble_notify(status_char_handle, pkt, sizeof(pkt));
+}
+
+/*******************************************************************************
+ * LINK QUALITY TELEMETRY (v4.15.3)
+ *
+ * 0xFA status frame (~1 Hz, piggybacked on coherence_task tick). Web
+ * Bluetooth doesn't expose RSSI to dashboard JS, so the only way to show
+ * BLE link health on the header pills is to measure RSSI in firmware and
+ * ship it up over 0xFF03.
+ *
+ * Payload (7 bytes total):
+ *   [0]       type = 0xFA
+ *   [1]       earclip_rssi  i8 — glasses↔earclip link, 0x7F = no link
+ *   [2]       dashboard_rssi i8 — glasses↔dashboard link, 0x7F = no link
+ *   [3-4]     mtu u16 LE — current ATT MTU on dashboard link (0 if none)
+ *   [5-6]     drops u16 LE — clamped ble_send_errors (cumulative notify fails)
+ *
+ * Sentinel 0x7F = "unknown / no connection on that side" so the dashboard
+ * can hide the bars for that pill without firmware needing to know what
+ * a null looks like over the wire. */
+static void emit_link_quality(void) {
+    if (!notifications_enabled || !is_connected) return;
+    if (status_char_handle == 0) return;
+
+    int8_t dash_rssi = 0x7F;
+    int8_t ec_rssi   = 0x7F;
+    if (g_conn_handle != 0xFFFF) {
+        int8_t r = 0;
+        if (ble_gap_conn_rssi(g_conn_handle, &r) == 0) dash_rssi = r;
+    }
+    uint16_t ec_conn = narbis_central_get_conn_handle();
+    if (ec_conn != 0xFFFF) {
+        int8_t r = 0;
+        if (ble_gap_conn_rssi(ec_conn, &r) == 0) ec_rssi = r;
+    }
+    uint16_t mtu = (g_conn_handle != 0xFFFF) ? ble_att_mtu(g_conn_handle) : 0;
+    uint16_t drops16 = (ble_send_errors > 0xFFFF) ? 0xFFFF : (uint16_t)ble_send_errors;
+
+    uint8_t pkt[7];
+    pkt[0] = 0xFA;
+    pkt[1] = (uint8_t)ec_rssi;
+    pkt[2] = (uint8_t)dash_rssi;
+    pkt[3] = (uint8_t)(mtu & 0xFF);
+    pkt[4] = (uint8_t)((mtu >> 8) & 0xFF);
+    pkt[5] = (uint8_t)(drops16 & 0xFF);
+    pkt[6] = (uint8_t)((drops16 >> 8) & 0xFF);
     nimble_notify(status_char_handle, pkt, sizeof(pkt));
 }
 
@@ -5741,6 +5788,9 @@ static void coherence_task(void *arg) {
         coh_compute();
         uint32_t dt = (uint32_t)(esp_timer_get_time() / 1000) - t0;
         coh_emit_packet();
+        /* 1 Hz link-quality snapshot on 0xFA — same cadence as coherence
+         * (this task is the project's 1 Hz telemetry heartbeat). */
+        emit_link_quality();
 
         /* v4.14.0: PPG-auto presence monitor runs at 1Hz piggybacking on
          * this task's tick. Gated by !PPG_TEST_BUILD so bench builds don't
