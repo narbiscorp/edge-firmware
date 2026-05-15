@@ -2206,6 +2206,13 @@ static volatile uint8_t coh_difficulty = 0;
 #define ADAPT_BPM_MAX      10     /* ~0.167 Hz / 6-sec cycle */
 #define ADAPT_BPM_START    6      /* initial pace on program entry */
 #define ADAPT_WINDOW_N     15     /* 15 samples at 1Hz = 15 seconds */
+/* Quintet = BPM × 5 (0.2 BPM per step). Pacer cycle = 300000 / quintet ms.
+ * ADAPT_MAX_STEP limits how many quintets (× 0.2 BPM) the pacer can shift
+ * per cycle boundary — prevents artifact-driven jumps (e.g. 4 → 8 BPM). */
+#define ADAPT_QUINTET_MIN   15u   /* 3.0 BPM */
+#define ADAPT_QUINTET_MAX   50u   /* 10.0 BPM */
+#define ADAPT_QUINTET_START 30u   /* 6.0 BPM */
+#define ADAPT_MAX_STEP       1u   /* max 0.2 BPM change per cycle update */
 
 static volatile uint8_t coh_pacer_adaptive = 1;   /* default ON */
 
@@ -2237,18 +2244,17 @@ static void adapt_resp_clear(void) {
     for (int i = 0; i < ADAPT_WINDOW_N; i++) adapt_resp_ring[i] = 0;
 }
 
-/* Return average resp BPM over the ring. Returns 0 if no data (caller
- * should use fallback value). */
-static uint8_t adapt_resp_bpm_avg(void) {
+/* Return average resp rate in quintets (BPM × 5, 0.2-BPM resolution).
+ * Returns 0 if no data. Formula: quintet = round(mhz × 3 / 10). */
+static uint8_t adapt_resp_quintet(void) {
     if (adapt_resp_count == 0) return 0;
     uint32_t sum = 0;
     for (int i = 0; i < adapt_resp_count; i++) sum += adapt_resp_ring[i];
     uint32_t avg_mhz = sum / adapt_resp_count;
-    /* BPM = Hz × 60 = (mHz / 1000) × 60 = mHz × 0.06 */
-    uint32_t bpm = (avg_mhz * 60 + 500) / 1000;   /* rounded */
-    if (bpm < ADAPT_BPM_MIN) bpm = ADAPT_BPM_MIN;
-    if (bpm > ADAPT_BPM_MAX) bpm = ADAPT_BPM_MAX;
-    return (uint8_t)bpm;
+    uint32_t q = (avg_mhz * 3u + 5u) / 10u;   /* round(bpm / 0.2) */
+    if (q < ADAPT_QUINTET_MIN) q = ADAPT_QUINTET_MIN;
+    if (q > ADAPT_QUINTET_MAX) q = ADAPT_QUINTET_MAX;
+    return (uint8_t)q;
 }
 
 /*******************************************************************************
@@ -2374,6 +2380,12 @@ static void coh_clear(void);
  * on the static-vs-non-static linkage mismatch at the real definition. */
 static void coh_push_ibi(uint32_t beat_ms, uint16_t ibi_ms);
 
+/* Threshold and state for the missed-beat outlier gate (on_earclip_ibi and
+ * 0xCA). Defined here — above process_command — so both callers can see them;
+ * the coherence section where the ring lives is further down the file. */
+#define IBI_OUTLIER_THRESHOLD_PCT  75u  /* reject IBI > avg × 1.75; catches missed-beat doubles */
+static uint32_t g_ibi_rolling_avg_ms = 0;  /* IIR rolling avg ms; 0 = uninit. Reset on disconnect. */
+
 /* v4.14.0 forward declaration. coh_state lives with the coherence module
  * at the bottom of the file, but led_task (defined earlier) needs to read
  * the latest coherence score to modulate the coherence-breathing duty.
@@ -2416,12 +2428,9 @@ static volatile uint8_t breathe_wave       = 0;    /* 0=sine, 1=linear */
  * individual u8 fields is sufficient. */
 static narbis_coh_params_t g_coh_params = NARBIS_COH_PARAMS_DEFAULTS_INIT;
 
-/* Current adaptive-pacer cycle BPM (Programs 2 & 4). Written by led_task
- * when the cycle duration changes (entry, boundary). Read by
- * coh_emit_packet so the dashboard can show what BPM the pacer actually
- * adopted vs. the instantaneous resp_peak_mhz (which may differ by a few
- * BPM until adapt_resp_bpm_avg's 15s ring converges). u8 access is
- * atomic on ESP32 — no mutex needed. 0 = no breathing program running. */
+/* Current adaptive-pacer rate in quintets (BPM × 5; 0.2-BPM steps).
+ * Written by led_task at cycle boundaries; read by coh_emit_packet (pkt[17]).
+ * Dashboard divides by 5 to display BPM. 0 = no breathing program running. */
 static volatile uint8_t coh_pacer_current_bpm = 0;
 
 /*******************************************************************************
@@ -3444,11 +3453,11 @@ static void led_task(void *param) {
             uint32_t now_tick = tick_count;
             if (cb_prev_mode != LED_MODE_COHERENCE_BREATHE &&
                 cb_prev_mode != LED_MODE_COHERENCE_BREATHE_STROBE) {
-                /* Entering the coherence-breathe family. Reset to 6 BPM
-                 * and start this cycle fresh at now. */
-                cb_cycle_ms = 60000 / ADAPT_BPM_START;
+                /* Entering the coherence-breathe family. Reset to 6.0 BPM
+                 * (quintet 30) and start this cycle fresh at now. */
+                cb_cycle_ms = 300000u / ADAPT_QUINTET_START;
                 cb_cycle_start_tick = now_tick;
-                coh_pacer_current_bpm = ADAPT_BPM_START;
+                coh_pacer_current_bpm = ADAPT_QUINTET_START;
             }
             cb_prev_mode = led_mode;
 
@@ -3459,19 +3468,28 @@ static void led_task(void *param) {
              * and reset the cycle clock. */
             if (elapsed_ms >= cb_cycle_ms) {
                 if (coh_pacer_adaptive) {
-                    uint8_t measured_bpm = adapt_resp_bpm_avg();
-                    if (measured_bpm > 0) {
-                        cb_cycle_ms = 60000 / measured_bpm;
-                        coh_pacer_current_bpm = measured_bpm;
+                    uint8_t target_q = adapt_resp_quintet();
+                    if (target_q > 0) {
+                        /* Slew-rate limit: max ADAPT_MAX_STEP quintets (0.2 BPM)
+                         * per cycle. Prevents artifact spikes from driving large
+                         * jumps (e.g. 4 → 8 BPM in one update). */
+                        uint8_t prev_q = coh_pacer_current_bpm;
+                        if (prev_q == 0) prev_q = target_q;  /* first latch: no slew */
+                        int8_t delta = (int8_t)((int16_t)target_q - (int16_t)prev_q);
+                        if (delta >  (int8_t)ADAPT_MAX_STEP) delta =  (int8_t)ADAPT_MAX_STEP;
+                        if (delta < -(int8_t)ADAPT_MAX_STEP) delta = -(int8_t)ADAPT_MAX_STEP;
+                        uint8_t new_q = (uint8_t)((int16_t)prev_q + delta);
+                        if (new_q < ADAPT_QUINTET_MIN) new_q = ADAPT_QUINTET_MIN;
+                        if (new_q > ADAPT_QUINTET_MAX) new_q = ADAPT_QUINTET_MAX;
+                        cb_cycle_ms = 300000u / new_q;
+                        coh_pacer_current_bpm = new_q;
                     }
-                    /* If measured_bpm is 0 (ring empty), keep previous
-                     * cycle — don't reset to BPM_START mid-session.
-                     * coh_pacer_current_bpm also stays so the dashboard
-                     * keeps showing the last adopted value. */
+                    /* If ring is empty keep previous cycle; dashboard keeps
+                     * showing last adopted value. */
                 } else {
-                    /* Disabled: force back to 6 BPM each cycle. Idempotent. */
-                    cb_cycle_ms = 60000 / ADAPT_BPM_START;
-                    coh_pacer_current_bpm = ADAPT_BPM_START;
+                    /* Disabled: force back to 6.0 BPM (quintet 30) each cycle. */
+                    cb_cycle_ms = 300000u / ADAPT_QUINTET_START;
+                    coh_pacer_current_bpm = ADAPT_QUINTET_START;
                 }
                 cb_cycle_start_tick = now_tick;
                 elapsed_ms = 0;
@@ -5410,7 +5428,6 @@ static bool ppg_detect(float filtered, uint32_t time_ms) {
  ******************************************************************************/
 
 #define COH_IBI_RING_SIZE     120   /* ~2 min at 60 bpm */
-#define IBI_OUTLIER_THRESHOLD_PCT  75u  /* reject IBI > avg × 1.75; catches missed-beat doubles */
 #define COH_GRID_N            256   /* FFT size, power of 2 */
 #define COH_GRID_HZ           4.0f  /* Resample rate (standard for HRV analysis) */
 #define COH_WINDOW_S          (COH_GRID_N / COH_GRID_HZ)  /* 64 seconds */
@@ -5436,7 +5453,6 @@ static coh_ibi_entry_t coh_ibi_ring[COH_IBI_RING_SIZE];
 static uint8_t coh_ibi_head = 0;        /* where next push goes */
 static uint8_t coh_ibi_count = 0;       /* how many valid entries (caps at ring size) */
 static portMUX_TYPE coh_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t g_ibi_rolling_avg_ms = 0;  /* IIR; 0 = uninitialized. Reset on earclip disconnect. */
 
 /* Push a beat into the ring. Called from ppg_task on every detected beat. */
 static void coh_push_ibi(uint32_t beat_ms, uint16_t ibi_ms) {
