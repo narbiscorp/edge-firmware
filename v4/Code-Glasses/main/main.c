@@ -4672,11 +4672,21 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
             };
             int rc = ble_gap_update_params(g_conn_handle, &upd);
             if (rc != 0) ESP_LOGW(TAG, "conn_update_params: %d", rc);
+            (void)ble_gap_set_prefered_le_phy(g_conn_handle,
+                                              BLE_GAP_LE_PHY_2M_MASK,
+                                              BLE_GAP_LE_PHY_2M_MASK, 0);
         } else {
             ESP_LOGW(TAG, "Connect failed status=%d, restart adv",
                      event->connect.status);
             start_advertising();
         }
+        return 0;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        ESP_LOGI(TAG, "peripheral phy update conn=%d tx=%d rx=%d status=%d",
+                 event->phy_updated.conn_handle,
+                 event->phy_updated.tx_phy, event->phy_updated.rx_phy,
+                 event->phy_updated.status);
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:

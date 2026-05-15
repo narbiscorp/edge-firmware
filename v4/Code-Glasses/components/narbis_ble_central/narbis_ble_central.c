@@ -916,6 +916,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
              * informational; discovery starts immediately and runs at
              * default MTU until the exchange completes. */
             (void)ble_gattc_exchange_mtu(S.conn_handle, on_mtu_complete, NULL);
+            (void)ble_gap_set_prefered_le_phy(S.conn_handle,
+                                              BLE_GAP_LE_PHY_2M_MASK,
+                                              BLE_GAP_LE_PHY_2M_MASK, 0);
             int rc = ble_gattc_disc_svc_by_uuid(S.conn_handle, &UUID_SVC.u,
                                                 on_svc_disc, NULL);
             if (rc != 0) cb_log("central: disc_svc rc=%d", rc);
@@ -923,6 +926,13 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
             cb_log("central: connect failed status=%d", event->connect.status);
             schedule_reconnect_backoff();
         }
+        return 0;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        cb_log("central: phy update conn=%u tx=%d rx=%d status=%d",
+               (unsigned)event->phy_updated.conn_handle,
+               event->phy_updated.tx_phy, event->phy_updated.rx_phy,
+               event->phy_updated.status);
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
