@@ -2380,6 +2380,11 @@ static void coh_clear(void);
  * on the static-vs-non-static linkage mismatch at the real definition. */
 static void coh_push_ibi(uint32_t beat_ms, uint16_t ibi_ms);
 
+/* Threshold used by the missed-beat outlier gate in both on_earclip_ibi
+ * and the 0xCA inject path. Defined here (above process_command) so both
+ * callers can see it; the coherence section below is after process_command. */
+#define IBI_OUTLIER_THRESHOLD_PCT  75u  /* reject IBI > avg × 1.75; catches missed-beat doubles */
+
 /* v4.14.0 forward declaration. coh_state lives with the coherence module
  * at the bottom of the file, but led_task (defined earlier) needs to read
  * the latest coherence score to modulate the coherence-breathing duty.
@@ -2426,6 +2431,11 @@ static narbis_coh_params_t g_coh_params = NARBIS_COH_PARAMS_DEFAULTS_INIT;
  * Written by led_task at cycle boundaries; read by coh_emit_packet (pkt[17]).
  * Dashboard divides by 5 to display BPM. 0 = no breathing program running. */
 static volatile uint8_t coh_pacer_current_bpm = 0;
+
+/* IIR rolling average of accepted IBI values (ms). Used by the missed-beat
+ * outlier gate in on_earclip_ibi and 0xCA. Defined here (above
+ * process_command) so both callers can see it; reset on earclip disconnect. */
+static uint32_t g_ibi_rolling_avg_ms = 0;
 
 /*******************************************************************************
  * PERSISTENT PREFERENCES LOADER (v4.14.35)
@@ -5422,7 +5432,6 @@ static bool ppg_detect(float filtered, uint32_t time_ms) {
  ******************************************************************************/
 
 #define COH_IBI_RING_SIZE     120   /* ~2 min at 60 bpm */
-#define IBI_OUTLIER_THRESHOLD_PCT  75u  /* reject IBI > avg × 1.75; catches missed-beat doubles */
 #define COH_GRID_N            256   /* FFT size, power of 2 */
 #define COH_GRID_HZ           4.0f  /* Resample rate (standard for HRV analysis) */
 #define COH_WINDOW_S          (COH_GRID_N / COH_GRID_HZ)  /* 64 seconds */
@@ -5448,7 +5457,6 @@ static coh_ibi_entry_t coh_ibi_ring[COH_IBI_RING_SIZE];
 static uint8_t coh_ibi_head = 0;        /* where next push goes */
 static uint8_t coh_ibi_count = 0;       /* how many valid entries (caps at ring size) */
 static portMUX_TYPE coh_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t g_ibi_rolling_avg_ms = 0;  /* IIR; 0 = uninitialized. Reset on earclip disconnect. */
 
 /* Push a beat into the ring. Called from ppg_task on every detected beat. */
 static void coh_push_ibi(uint32_t beat_ms, uint16_t ibi_ms) {
