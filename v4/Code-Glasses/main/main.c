@@ -73,7 +73,10 @@
  * BLE COMMANDS (multi-byte to 0xFF01):
  * 
  *   COMMON:
+ *   - A0 [tau]            Lens smoothing time constant ×10ms, 0=off (v4.15.7)
+ *   - A1 [slew]           Lens max transition rate %/100ms, 0=unlimited (v4.15.7)
  *   - A2 [brightness]     Set max tint 0-100%
+ *   - A3 [mode]           On BLE disconnect: 0=continue program, 1=fail clear (v4.15.7)
  *   - A4 [minutes]        Set session duration 1-60 min
  *   - A7 00               Sleep immediately
  * 
@@ -109,6 +112,29 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.15.7 (lens-config):
+ * - Three persisted lens config knobs, BLE-settable (COMMON range, beside
+ *   A2/A4). All default 0 = bit-for-bit pre-4.15.7 behavior; missing NVS
+ *   keys (OTA upgrades) and 0xBF factory reset land on the same defaults.
+ *   - A0 [tau]  Lens smoothing: EMA time constant ×10ms (0-255 → 0-2.55s,
+ *     0=off). Streamed STATIC commands (manual-controller sweep, SDK
+ *     effects) glide between targets instead of stepping — fixes visible
+ *     chop when the host update rate drops (~12Hz / noisy-RF retransmits).
+ *   - A1 [slew] Lens max transition rate %/100ms (0=unlimited). Global
+ *     safety cap on commanded STATIC transitions, generalizing the
+ *     breathe-only LENS_SLEW_MAX_STEP_PCT idea. Breathe's own 4%/tick
+ *     limiter is untouched.
+ *   - A3 [mode] On-disconnect behavior: 0=continue running program
+ *     (historical), 1=fail clear (strobe_stop + STATIC target 0, riding
+ *     the smoothing knob if set). Detection latency bounded by the 20s
+ *     supervision timeout. Does not touch session_active (0xA6 gates
+ *     strobe_start on it); hall-tap / PPG-auto standalone features are
+ *     unaffected.
+ * - Glide engine: lens_apply_static() + a STATIC branch in led_task's
+ *   10ms tick. Q8 integer math (no float). Applies ONLY to commanded
+ *   STATIC duty — strobe square wave, breathe waveform, indicator, and
+ *   coherence-lens EWMA are all untouched.
+ *
  * CHANGELOG v4.15.6 (strobe-sync):
  * - App-paced breath+strobe. 0xB0 now takes an arg: 0xB0 0x01 enters
  *   LED_MODE_BREATHE_STROBE (standalone breathe+strobe), which shares the same
@@ -1576,7 +1602,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.6-strobe-sync"
+#define FIRMWARE_VERSION "4.15.7-lens-config"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -1930,6 +1956,13 @@ typedef enum {
 static volatile bool session_active = false;
 static volatile uint8_t brightness = DEFAULT_BRIGHTNESS;
 static volatile uint32_t session_duration_ms = DEFAULT_SESSION_MIN * 60 * 1000;
+
+/* v4.15.7: lens config knobs (BLE A0/A1/A3, NVS-persisted). All default 0
+ * = historical behavior: static writes snap, no global slew cap, and a BLE
+ * disconnect leaves the running program running. */
+static volatile uint8_t lens_smooth_tau = 0;   /* EMA time constant, ×10ms. 0=off */
+static volatile uint8_t lens_slew_cfg   = 0;   /* max lens slew, %/100ms. 0=unlimited */
+static volatile uint8_t dc_behavior     = 0;   /* on disconnect: 0=continue, 1=fail clear */
 static volatile uint32_t session_start_tick = 0;
 
 /* LED mode — v4.10.0: startup now BREATHE (Program 1), was STROBE.
@@ -2366,6 +2399,11 @@ static uint8_t adapt_resp_quintet(void) {
 #define KEY_COH_DIFFICULTY     "coh_diff"
 #define KEY_COH_ADAPTIVE       "coh_adapt"   /* v4.14.32 */
 
+/* v4.15.7: lens config knobs (BLE A0/A1/A3). */
+#define KEY_SMOOTH_TAU         "smth_tau"
+#define KEY_SLEW_MAX           "slew_max"
+#define KEY_DC_BEHAV           "dc_behav"
+
 /* Coherence-pipeline tuning (live-settable via 0xE0 COH_PARAMS).
  * One u8 per field for simplicity; matches the existing prefs_get_u8 path. */
 #define KEY_COH_MINIBIS        "coh_minibi"
@@ -2544,6 +2582,12 @@ static void prefs_load(void) {
     coh_difficulty      = prefs_get_u8 (KEY_COH_DIFFICULTY,   0);
     coh_pacer_adaptive  = prefs_get_u8 (KEY_COH_ADAPTIVE,     1);  /* v4.14.32: default ON */
 
+    /* v4.15.7: lens config knobs. 0/0/0 = pre-4.15.7 behavior, so units
+     * upgrading via OTA (no keys yet) and factory resets are unchanged. */
+    lens_smooth_tau     = prefs_get_u8 (KEY_SMOOTH_TAU,       0);
+    lens_slew_cfg       = prefs_get_u8 (KEY_SLEW_MAX,         0);
+    dc_behavior         = prefs_get_u8 (KEY_DC_BEHAV,         0);
+
     /* Coherence-pipeline tuning — loaded into g_coh_params. Defaults
      * mirror NARBIS_COH_PARAMS_DEFAULTS_INIT so a fresh NVS or a missing
      * key both land on the same algorithm shape that's compiled in. */
@@ -2575,6 +2619,30 @@ static void prefs_load(void) {
 
 /* AC drive state - shared between tasks */
 static volatile uint8_t effective_duty = 0;
+
+/* v4.15.7: STATIC-mode glide state (lens config knobs A0/A1).
+ * lens_apply_static() is the single entry point for commanded static duty
+ * (legacy 1-byte, 0xA5, disconnect fail-clear). With both knobs at 0 it
+ * writes effective_duty directly — bit-for-bit the historical snap. With
+ * either knob set it arms a glide that led_task's 10ms STATIC branch steps
+ * toward the target (EMA first, then slew clamp; Q8 integer math only).
+ * Shared BLE task ↔ led_task under the same volatile conventions as the
+ * rest of this file; a one-tick stale read is harmless. */
+static volatile uint8_t  lens_target_duty  = 0;   /* commanded duty 0-100 */
+static volatile bool     lens_glide_active = false;
+static volatile uint16_t lens_smooth_q8    = 0;   /* current duty ×256 (max 25600) */
+
+static void lens_apply_static(uint8_t duty) {
+    if (duty > 100) duty = 100;
+    lens_target_duty = duty;
+    if (lens_smooth_tau == 0 && lens_slew_cfg == 0) {
+        lens_glide_active = false;
+        effective_duty = duty;                            /* historical snap path */
+    } else {
+        lens_smooth_q8 = (uint16_t)effective_duty << 8;   /* glide from where we are */
+        lens_glide_active = true;
+    }
+}
 
 /* Breathing fraction for ISR consumption (v4.10.0).
  * 0..255 representing 0.0..1.0 of the breath cycle.
@@ -3754,7 +3822,48 @@ static void led_task(void *param) {
         }
         
         /* STROBE mode: gptimer ISR handles effective_duty, nothing to do here */
-        /* STATIC mode: effective_duty set by command handler, nothing here */
+
+        /* v4.15.7: STATIC mode — glide toward the commanded target when a
+         * lens config knob (A0 smoothing / A1 slew) is active. The default
+         * knobs-off path never arms lens_glide_active, so this branch is
+         * inert and STATIC keeps its historical snap (duty written directly
+         * by the command handler). EMA first (feel), then the slew clamp
+         * (hard cap). Q8 integer math only — no float. */
+        else if (led_mode == LED_MODE_STATIC && lens_glide_active) {
+            int32_t target_q8 = (int32_t)lens_target_duty << 8;
+            int32_t cur_q8    = (int32_t)lens_smooth_q8;
+            int32_t diff      = target_q8 - cur_q8;
+
+            if (diff == 0) {
+                lens_glide_active = false;
+            } else {
+                /* EMA step: alpha = 1/tau per tick (tau in 10ms units).
+                 * tau==0 → no smoothing: step the full remaining distance
+                 * (pure rate-limit mode). */
+                int32_t step = (lens_smooth_tau > 0)
+                                   ? diff / (int32_t)lens_smooth_tau
+                                   : diff;
+                /* Truncation guard so the EMA tail converges. */
+                if (step == 0) step = (diff > 0) ? 1 : -1;
+
+                /* Slew clamp: lens_slew_cfg %/100ms → (<<8)/10 per 10ms tick. */
+                if (lens_slew_cfg > 0) {
+                    int32_t max_step = ((int32_t)lens_slew_cfg << 8) / 10;
+                    if (max_step == 0) max_step = 1;
+                    if (step >  max_step) step =  max_step;
+                    if (step < -max_step) step = -max_step;
+                }
+
+                cur_q8 += step;
+                if ((diff > 0 && cur_q8 >= target_q8) ||
+                    (diff < 0 && cur_q8 <= target_q8)) {
+                    cur_q8 = target_q8;          /* landed — finish crisply */
+                    lens_glide_active = false;
+                }
+                lens_smooth_q8 = (uint16_t)cur_q8;
+                effective_duty = (uint8_t)(cur_q8 >> 8);
+            }
+        }
         
         vTaskDelay(AC_PERIOD_TICKS);  /* 10ms tick */
         tick_count++;
@@ -4139,7 +4248,7 @@ static void process_command(uint8_t *data, uint16_t len) {
         brightness = duty;
         strobe_stop();
         led_mode = LED_MODE_STATIC;
-        effective_duty = brightness;
+        lens_apply_static(brightness);   /* v4.15.7: honors smoothing/slew knobs */
         return;
     }
     
@@ -4165,14 +4274,35 @@ static void process_command(uint8_t *data, uint16_t len) {
             prefs_set_u32(KEY_SESSION_MIN, arg);
             ESP_LOGI(TAG, "Session: %d minutes (saved)", arg);
             break;
-            
+
+        /* ── LENS CONFIG (v4.15.7) — persisted knobs ───────── */
+        case 0xA0:  /* Lens smoothing time constant (×10ms, 0=off) */
+            lens_smooth_tau = arg;
+            prefs_set_u8(KEY_SMOOTH_TAU, arg);
+            ESP_LOGI(TAG, "Lens smoothing: tau=%dms (saved)", (int)arg * 10);
+            break;
+
+        case 0xA1:  /* Lens max transition rate (%/100ms, 0=unlimited) */
+            if (arg > 100) arg = 100;
+            lens_slew_cfg = arg;
+            prefs_set_u8(KEY_SLEW_MAX, arg);
+            ESP_LOGI(TAG, "Lens slew cap: %d%%/100ms (saved)", arg);
+            break;
+
+        case 0xA3:  /* On-disconnect behavior: 0=continue program, 1=fail clear */
+            dc_behavior = (arg > 1) ? 1 : arg;
+            prefs_set_u8(KEY_DC_BEHAV, dc_behavior);
+            ESP_LOGI(TAG, "On-disconnect: %s (saved)",
+                     dc_behavior ? "fail clear" : "continue");
+            break;
+
         /* ── MODE SWITCHING ────────────────────────────────── */
         case 0xA5:  /* Enter STATIC mode */
             if (arg > 100) arg = 100;
             brightness = arg;
             strobe_stop();
             led_mode = LED_MODE_STATIC;
-            effective_duty = brightness;
+            lens_apply_static(brightness);   /* v4.15.7: honors smoothing/slew knobs */
             ESP_LOGI(TAG, "Mode: STATIC @ %d%%", arg);
             break;
             
@@ -4982,6 +5112,24 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
             esp_ota_abort(ota_handle);
             in_ota_mode = false;
             ESP_LOGW(TAG, "OTA cancelled due to disconnect");
+        }
+
+        /* v4.15.7: optional fail-safe (0xA3 arg 1). Drop to a clear STATIC
+         * lens when the app link dies, instead of letting the running
+         * program continue (historical default, dc_behavior==0). Rides
+         * lens_apply_static so a configured smoothing knob glides it clear.
+         * Detection latency is bounded by the 20s supervision timeout
+         * (deliberate — OTA erase holds the radio silent up to 19s).
+         * Deliberately does NOT touch session_active: 0xA6 gates
+         * strobe_start on it, so clearing it would break strobe after a
+         * reconnect. Hall-tap / PPG-auto standalone features can still
+         * start a program afterwards — this knob only governs the moment
+         * the BLE link drops. */
+        if (dc_behavior == 1) {
+            strobe_stop();
+            led_mode = LED_MODE_STATIC;
+            lens_apply_static(0);
+            ESP_LOGW(TAG, "BLE lost -> fail-clear engaged (0xA3=1)");
         }
 
         /* Restart adv with a fresh auto-off window (v4.11.0). */
