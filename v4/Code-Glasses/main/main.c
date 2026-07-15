@@ -112,6 +112,16 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.15.8 (lens-config fix):
+ * - Fix: lens smoothing (A0) stalled a few duty-% short of target under a
+ *   continuous single-byte PWM stream (host-rendered breathe / feedback).
+ *   lens_apply_static() re-seeded the Q8 EMA accumulator from the floored
+ *   effective_duty on EVERY write, discarding sub-unit progress; at 12-20 Hz
+ *   that floored every ~50 ms and the glide could never close the last ~2-4%,
+ *   clipping breathe extremes. Now the accumulator is seeded only when arming
+ *   a glide from a settled state; an in-flight glide just retargets. Snap path
+ *   (knobs off) and one-shot commands unaffected.
+ *
  * CHANGELOG v4.15.7 (lens-config):
  * - Three persisted lens config knobs, BLE-settable (COMMON range, beside
  *   A2/A4). All default 0 = bit-for-bit pre-4.15.7 behavior; missing NVS
@@ -1602,7 +1612,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.7-lens-config"
+#define FIRMWARE_VERSION "4.15.8-lens-config"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -2639,7 +2649,18 @@ static void lens_apply_static(uint8_t duty) {
         lens_glide_active = false;
         effective_duty = duty;                            /* historical snap path */
     } else {
-        lens_smooth_q8 = (uint16_t)effective_duty << 8;   /* glide from where we are */
+        /* v4.15.8: seed the Q8 accumulator ONLY when arming a glide from a
+         * settled/snap state. While a glide is already in flight we keep the
+         * full-precision accumulator and merely retarget (lens_target_duty
+         * above). Re-seeding from the floored effective_duty on every call
+         * would discard the accumulator's sub-unit fraction — under a 12-20 Hz
+         * single-byte stream (each write hits this via the len==1 path) that
+         * floored every ~50 ms, stalling the glide a few duty-% short of target
+         * and clipping breathe extremes. Guarding the seed lets the EMA reach
+         * the commanded value. */
+        if (!lens_glide_active) {
+            lens_smooth_q8 = (uint16_t)effective_duty << 8;   /* glide from where we are */
+        }
         lens_glide_active = true;
     }
 }
