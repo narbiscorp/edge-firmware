@@ -2688,6 +2688,31 @@ static volatile uint16_t lens_smooth_q8    = 0;   /* current duty ×256 (max 256
  * glide branch; cleared by the snap path. Gated in the ISR to STATIC mode. */
 static volatile int32_t lens_fine_raw = -1;
 
+#if FCC_TEST_BUILD
+/* ── FCC TEST STATE (FCC build only) ───────────────────────────────────────
+ * Declared here, not next to fcc_task further down, because hall_task sits
+ * between the two and reads fcc_dtm_active / fcc_stop_req to claim the magnet
+ * gesture as the DTM escape (there is no BLE link during DTM to send a stop
+ * over). The full rationale for the mode lives at the FCC TEST MODE block. */
+#define FCC_DTM_PAYLOAD_PRBS9   0x00   /* standard modulated FCC pattern */
+#define FCC_DTM_LEN             37     /* max payload → highest duty cycle */
+#define FCC_DEFAULT_MINUTES     12
+#define FCC_HCI_LE_TX_TEST      0x201E
+#define FCC_HCI_LE_TEST_END     0x201F
+
+static volatile uint8_t fcc_channel    = 0;               /* RF/PHY ch 0-39 */
+static volatile uint8_t fcc_pwr_lvl    = ESP_PWR_LVL_P9;  /* default +9 dBm */
+static volatile uint8_t fcc_minutes    = FCC_DEFAULT_MINUTES;
+static volatile bool    fcc_dtm_active = false;
+static volatile bool    fcc_stop_req   = false;
+static volatile bool    fcc_start_req  = false;
+static TaskHandle_t     fcc_task_handle = NULL;
+
+/* ESP_PWR_LVL_N12(0) → -12 dBm ... ESP_PWR_LVL_P9(7) → +9 dBm, 3 dB apart. */
+static inline int fcc_dbm_of(uint8_t lvl) { return -12 + 3 * (int)lvl; }
+static inline uint32_t fcc_mhz_of(uint8_t ch) { return 2402u + 2u * (uint32_t)ch; }
+#endif /* FCC_TEST_BUILD */
+
 static void lens_apply_static(uint8_t duty) {
     if (duty > 100) duty = 100;
     lens_target_duty = duty;
@@ -4336,23 +4361,11 @@ static void ota_do_cancel(void) {
  * 1 dB steps are NOT possible on this silicon — esp_bt.h documents that asking
  * for +7 yields +9. The UI therefore offers exactly these 8 levels.
  ******************************************************************************/
-#define FCC_DTM_PAYLOAD_PRBS9   0x00   /* standard modulated FCC pattern */
-#define FCC_DTM_LEN             37     /* max payload → highest duty cycle */
-#define FCC_DEFAULT_MINUTES     12
-#define FCC_HCI_LE_TX_TEST      0x201E
-#define FCC_HCI_LE_TEST_END     0x201F
-
-static volatile uint8_t fcc_channel    = 0;               /* RF/PHY ch 0-39 */
-static volatile uint8_t fcc_pwr_lvl    = ESP_PWR_LVL_P9;  /* default +9 dBm */
-static volatile uint8_t fcc_minutes    = FCC_DEFAULT_MINUTES;
-static volatile bool    fcc_dtm_active = false;
-static volatile bool    fcc_stop_req   = false;
-static volatile bool    fcc_start_req  = false;
-static TaskHandle_t     fcc_task_handle = NULL;
-
-/* ESP_PWR_LVL_N12(0) → -12 dBm ... ESP_PWR_LVL_P9(7) → +9 dBm, 3 dB apart. */
-static inline int fcc_dbm_of(uint8_t lvl) { return -12 + 3 * (int)lvl; }
-static inline uint32_t fcc_mhz_of(uint8_t ch) { return 2402u + 2u * (uint32_t)ch; }
+/* State, constants and the unit helpers live up with the other globals (see
+ * "FCC TEST STATE") because hall_task — which sits above this block — reads
+ * fcc_dtm_active / fcc_stop_req to claim the magnet gesture as the DTM escape.
+ * Only the VHCI plumbing and the worker live here, below the BLE stack
+ * helpers they depend on. */
 
 /* VHCI needs a registered callback before it will accept packets. We only
  * transmit, so events from the controller are acknowledged and dropped. */
