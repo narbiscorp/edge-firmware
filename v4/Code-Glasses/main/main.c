@@ -112,6 +112,18 @@
  *
  * LEGACY: Single byte 0x00-0xFF → static mode at byte*100/255
  * 
+ * CHANGELOG v4.15.9 (lens-config fix 2):
+ * - Fix: smoothed static output was still visibly "jittery"/stepped even at
+ *   max smoothing. The EMA accumulator is 16-bit (Q8) but effective_duty —
+ *   the value the AC-drive ISR mapped to raw PWM — is uint8_t (0-100), so the
+ *   lens only ever showed ~101 of the 1024 PWM levels regardless of smoothing,
+ *   with a hard 0→265 raw cliff (clear→26%) at the bottom of the range.
+ *   Smoothing fixed the *timing* but the *amplitude* was requantized to 1%
+ *   duty steps. Now the STATIC glide publishes a full-resolution raw value
+ *   (duty_q8_to_raw, ramped across duty 0..1 to kill the cliff) that the ISR
+ *   uses directly in plain STATIC mode; every other path is unchanged.
+ *   Simulated: ~85 → ~590 distinct PWM levels, max per-tick step 8 → 3 raw.
+ *
  * CHANGELOG v4.15.8 (lens-config fix):
  * - Fix: lens smoothing (A0) stalled a few duty-% short of target under a
  *   continuous single-byte PWM stream (host-rendered breathe / feedback).
@@ -1612,7 +1624,7 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
-#define FIRMWARE_VERSION "4.15.8-lens-config"
+#define FIRMWARE_VERSION "4.15.9-lens-config"
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -1811,6 +1823,22 @@ static inline uint32_t duty_to_raw(uint8_t duty_percent) {
     if (duty_percent > 100) duty_percent = 100;
     return LENS_VISIBLE_FLOOR_RAW +
            (uint32_t)(duty_percent - 1) * (PWM_MAX_RAW - LENS_VISIBLE_FLOOR_RAW) / 99;
+}
+
+/* v4.15.9: fine-resolution duty→raw for the smoothing glide. Input is duty in
+ * Q8 (0..100<<8 = 0..25600); output carries the sub-1% fraction so the EMA
+ * reaches the lens at full 10-bit PWM resolution instead of the 101-level
+ * integer-duty grid that duty_to_raw() produces (the source of "jittery"
+ * stepping under a smoothed stream). It also ramps linearly 0→floor across
+ * duty 0..1 so the clear→visible edge doesn't cliff (duty_to_raw jumps 0→265).
+ * Integer-only; the /(99<<8) is a compile-time constant. Max intermediate
+ * 25344*758 ≈ 1.9e7 fits int32. */
+static inline int32_t duty_q8_to_raw(int32_t q8) {
+    if (q8 <= 0) return 0;
+    if (q8 >= (100 << 8)) return PWM_MAX_RAW;
+    if (q8 < (1 << 8)) return (q8 * LENS_VISIBLE_FLOOR_RAW) >> 8;   /* duty<1: 0..floor */
+    return LENS_VISIBLE_FLOOR_RAW +
+           (q8 - (1 << 8)) * (PWM_MAX_RAW - LENS_VISIBLE_FLOOR_RAW) / (99 << 8);
 }
 
 /*******************************************************************************
@@ -2641,12 +2669,18 @@ static volatile uint8_t effective_duty = 0;
 static volatile uint8_t  lens_target_duty  = 0;   /* commanded duty 0-100 */
 static volatile bool     lens_glide_active = false;
 static volatile uint16_t lens_smooth_q8    = 0;   /* current duty ×256 (max 25600) */
+/* v4.15.9: fine-grained raw PWM for the smoothed static glide. >= 0 → the AC
+ * drive ISR uses it directly (full 10-bit resolution); < 0 → the ISR falls
+ * back to the 101-level duty_to_raw(effective_duty). Set only by the STATIC
+ * glide branch; cleared by the snap path. Gated in the ISR to STATIC mode. */
+static volatile int32_t lens_fine_raw = -1;
 
 static void lens_apply_static(uint8_t duty) {
     if (duty > 100) duty = 100;
     lens_target_duty = duty;
     if (lens_smooth_tau == 0 && lens_slew_cfg == 0) {
         lens_glide_active = false;
+        lens_fine_raw = -1;                               /* v4.15.9: coarse integer-duty path */
         effective_duty = duty;                            /* historical snap path */
     } else {
         /* v4.15.8: seed the Q8 accumulator ONLY when arming a glide from a
@@ -2662,6 +2696,14 @@ static void lens_apply_static(uint8_t duty) {
             lens_smooth_q8 = (uint16_t)effective_duty << 8;   /* glide from where we are */
         }
         lens_glide_active = true;
+        /* v4.15.9: publish the fine raw for the current accumulator position
+         * NOW, synchronously. Without this, a re-entry whose first glide tick
+         * lands via the diff==0 early-return (target already reached) would
+         * leave lens_fine_raw holding an earlier target's raw, and the ISR —
+         * which gates on STATIC, not on glide_active — would drive that stale
+         * value. Seeding from the current position (not the target) means no
+         * pre-glide jump; the glide then tracks toward the target from here. */
+        lens_fine_raw = duty_q8_to_raw((int32_t)lens_smooth_q8);
     }
 }
 
@@ -2933,7 +2975,16 @@ static bool IRAM_ATTR drive_timer_cb(gptimer_handle_t timer,
     }
 
     /* ── Apply PWM with AC phase ── */
-    uint32_t raw = duty_to_raw_isr(effective_duty);
+    /* v4.15.9: prefer the smoothing glide's fine-grained raw (full 10-bit
+     * resolution) over the 101-level integer-duty map, but only in plain
+     * STATIC mode with a live session and no indicator override — every other
+     * path (strobe/breathe/indicator/OTA/session-off, which set effective_duty
+     * directly) keeps the standard mapping. */
+    int32_t fine = lens_fine_raw;
+    uint32_t raw = (fine >= 0 && led_mode == LED_MODE_STATIC && !ind_owns
+                    && session_active && !in_ota_mode)
+                     ? (uint32_t)fine
+                     : duty_to_raw_isr(effective_duty);
     if (ac_phase == 0) {
         pwm1_set_isr(raw);
         pwm2_set_isr(1);
@@ -3856,6 +3907,10 @@ static void led_task(void *param) {
             int32_t diff      = target_q8 - cur_q8;
 
             if (diff == 0) {
+                /* v4.15.9: already at target — keep lens_fine_raw consistent
+                 * with the settled position so the ISR never drives a stale
+                 * earlier-target raw after a re-entry that lands immediately. */
+                lens_fine_raw = duty_q8_to_raw(cur_q8);
                 lens_glide_active = false;
             } else {
                 /* EMA step: alpha = 1/tau per tick (tau in 10ms units).
@@ -3883,6 +3938,10 @@ static void led_task(void *param) {
                 }
                 lens_smooth_q8 = (uint16_t)cur_q8;
                 effective_duty = (uint8_t)(cur_q8 >> 8);
+                /* v4.15.9: publish the full-precision raw so the ISR drives the
+                 * lens at 10-bit resolution — the integer effective_duty above
+                 * is kept only for telemetry/logging/other readers. */
+                lens_fine_raw = duty_q8_to_raw(cur_q8);
             }
         }
         
