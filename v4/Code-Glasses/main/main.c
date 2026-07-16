@@ -1624,7 +1624,20 @@
 /*******************************************************************************
  * VERSION AND IDENTIFICATION
  ******************************************************************************/
+/* FCC_TEST_BUILD is set by the separate narbiscorp/edge-firmware-fcc CI
+ * (-DFCC_TEST_BUILD=1). Default 0 → production builds are byte-identical to
+ * before: no DTM code, no fcc_task, no AE/AF/BB/C6 opcodes. The version string
+ * carries the suffix so the app's `Narbis fw v…` hello makes the build obvious
+ * — an FCC binary must never be mistaken for a shippable one. */
+#ifndef FCC_TEST_BUILD
+#define FCC_TEST_BUILD 0
+#endif
+
+#if FCC_TEST_BUILD
+#define FIRMWARE_VERSION "4.15.9-FCC-TEST"
+#else
 #define FIRMWARE_VERSION "4.15.9-lens-config"
+#endif
 static const char *TAG = "SG_v4.14.39";
 
 /*******************************************************************************
@@ -4054,6 +4067,23 @@ static void hall_task(void *param) {
         uint8_t level = hall_debounced_level();
         uint32_t now = xTaskGetTickCount();
 
+#if FCC_TEST_BUILD
+        /* FCC build: while DTM is transmitting there is no BLE link to send a
+         * stop over, so a magnet tap is the manual escape. hall_task keeps
+         * running during DTM (only the BLE stack is torn down). Claim the
+         * gesture here and skip the normal program-cycle / sleep handling —
+         * fcc_task sees the flag, ends the test, and restores BLE. */
+        if (fcc_dtm_active) {
+            if (level == 1 && prev_level == 0) {
+                ESP_LOGW(TAG, "FCC: magnet tap → ending DTM early");
+                fcc_stop_req = true;
+            }
+            prev_level = level;
+            vTaskDelay(pdMS_TO_TICKS(HALL_POLL_MS));
+            continue;
+        }
+#endif
+
         /* Rising edge: magnet just closed */
         if (level == 1 && prev_level == 0) {
             high_start_tick = now;
@@ -4269,6 +4299,164 @@ static void ota_do_cancel(void) {
     }
 }
 
+#if FCC_TEST_BUILD
+/*******************************************************************************
+ * FCC TEST MODE — DTM (Direct Test Mode) continuous carrier
+ *
+ * Compiled ONLY into the FCC build (FCC_TEST_BUILD=1, built by the separate
+ * narbiscorp/edge-firmware-fcc repo). Production binaries contain none of this.
+ *
+ * WHY DTM: the FCC low/mid/high set is 2402 / 2440 / 2480 MHz = RF/PHY channel
+ * 0 / 19 / 39 (freq = 2402 + 2*ch). 2402 and 2480 are BLE *advertising*
+ * channels — a data connection NEVER transmits there — so a connected-mode
+ * "channel lock" physically cannot produce 2 of the 3. Only the LE Transmitter
+ * Test (DTM) can put a carrier on an arbitrary RF channel.
+ *
+ * CONSEQUENCE: DTM has no BLE link. The host configures channel/power over BLE
+ * (each command is confirmed via ble_log → 0xF1 frames the app displays), then
+ * starts DTM — at which point the link intentionally drops and stays down until
+ * the duration expires or a magnet tap ends it early. There is no live
+ * reporting *during* transmission; that is inherent to DTM, not a limitation
+ * of this implementation.
+ *
+ * MECHANISM (mirrors the ESP-IDF controller_vhci_ble_adv example, which
+ * officially supports ESP32): tear the NimBLE host + controller down, bring a
+ * BARE controller up (no host), then push raw HCI straight at it over VHCI:
+ *   LE Transmitter Test  opcode 0x201E : [01][1E 20][03][chan][len][payload]
+ *   LE Test End          opcode 0x201F : [01][1F 20][00]
+ * On exit we drop the controller and re-init NimBLE so the glasses advertise
+ * again — no power cycle needed between channel/power sweeps.
+ *
+ * TASK CONTEXT IS LOAD-BEARING: process_command() runs in the NimBLE host
+ * task, and the teardown calls nimble_port_stop() — doing that from the host
+ * task itself would deadlock. So the BLE handler only sets fcc_start_req and
+ * notifies fcc_task, exactly like the OTA commands defer to ota_task.
+ *
+ * TX POWER: ESP32 exposes 8 levels 3 dB apart (ESP_PWR_LVL_N12..P9 = -12..+9).
+ * 1 dB steps are NOT possible on this silicon — esp_bt.h documents that asking
+ * for +7 yields +9. The UI therefore offers exactly these 8 levels.
+ ******************************************************************************/
+#define FCC_DTM_PAYLOAD_PRBS9   0x00   /* standard modulated FCC pattern */
+#define FCC_DTM_LEN             37     /* max payload → highest duty cycle */
+#define FCC_DEFAULT_MINUTES     12
+#define FCC_HCI_LE_TX_TEST      0x201E
+#define FCC_HCI_LE_TEST_END     0x201F
+
+static volatile uint8_t fcc_channel    = 0;               /* RF/PHY ch 0-39 */
+static volatile uint8_t fcc_pwr_lvl    = ESP_PWR_LVL_P9;  /* default +9 dBm */
+static volatile uint8_t fcc_minutes    = FCC_DEFAULT_MINUTES;
+static volatile bool    fcc_dtm_active = false;
+static volatile bool    fcc_stop_req   = false;
+static volatile bool    fcc_start_req  = false;
+static TaskHandle_t     fcc_task_handle = NULL;
+
+/* ESP_PWR_LVL_N12(0) → -12 dBm ... ESP_PWR_LVL_P9(7) → +9 dBm, 3 dB apart. */
+static inline int fcc_dbm_of(uint8_t lvl) { return -12 + 3 * (int)lvl; }
+static inline uint32_t fcc_mhz_of(uint8_t ch) { return 2402u + 2u * (uint32_t)ch; }
+
+/* VHCI needs a registered callback before it will accept packets. We only
+ * transmit, so events from the controller are acknowledged and dropped. */
+static void fcc_vhci_send_ready(void) { }
+static int  fcc_vhci_recv(uint8_t *data, uint16_t len) { (void)data; (void)len; return 0; }
+static const esp_vhci_host_callback_t fcc_vhci_cb = {
+    .notify_host_send_available = fcc_vhci_send_ready,
+    .notify_host_recv           = fcc_vhci_recv,
+};
+
+static void fcc_hci_send(uint8_t *pkt, uint16_t len) {
+    /* Bounded wait — never block the task forever if the controller wedges. */
+    for (int i = 0; i < 100 && !esp_vhci_host_check_send_available(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    esp_vhci_host_send_packet(pkt, len);
+}
+
+/* Runs ONLY in fcc_task context (never the BLE host task). */
+static void fcc_dtm_run(void) {
+    uint8_t ch  = fcc_channel;
+    uint8_t lvl = fcc_pwr_lvl;
+    uint8_t min = fcc_minutes ? fcc_minutes : FCC_DEFAULT_MINUTES;
+
+    ESP_LOGW(TAG, "FCC: DTM start ch%u (%lu MHz) %+d dBm for %u min",
+             (unsigned)ch, (unsigned long)fcc_mhz_of(ch), fcc_dbm_of(lvl), (unsigned)min);
+
+    /* Stop the lens so the DUT isn't also driving the electrochromic AC
+     * during an emissions measurement. */
+    strobe_stop();
+    led_mode = LED_MODE_STATIC;
+    lens_apply_static(0);
+
+    /* Let the "link dropping" 0xF1 frame the handler just queued actually go
+     * out before we tear the host down, so the app's report box shows why it
+     * lost the connection instead of a bare disconnect. */
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    ble_stack_teardown();                  /* host + controller down, VHCI freed */
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_bt_controller_init(&cfg);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: ctrl init %s", esp_err_to_name(err)); goto restore; }
+    err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: ctrl enable %s", esp_err_to_name(err)); goto deinit; }
+    err = esp_vhci_host_register_callback(&fcc_vhci_cb);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: vhci cb %s", esp_err_to_name(err)); goto disable; }
+
+    /* Power must be set on the live controller, before the test starts. */
+    err = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, (esp_power_level_t)lvl);
+    if (err != ESP_OK) ESP_LOGW(TAG, "FCC: tx_power_set %s", esp_err_to_name(err));
+
+    {   /* HCI LE Transmitter Test: [pkt=cmd][opcode LE][plen][chan][len][payload] */
+        uint8_t pkt[7] = { 0x01,
+                           (uint8_t)(FCC_HCI_LE_TX_TEST & 0xFF),
+                           (uint8_t)(FCC_HCI_LE_TX_TEST >> 8),
+                           0x03, ch, FCC_DTM_LEN, FCC_DTM_PAYLOAD_PRBS9 };
+        fcc_hci_send(pkt, sizeof(pkt));
+    }
+    fcc_dtm_active = true;
+    ESP_LOGW(TAG, "FCC: TRANSMITTING — BLE link is down by design");
+
+    {   /* Hold for the duration, or until a magnet tap sets fcc_stop_req. */
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)min * 60000u);
+        while (!fcc_stop_req && xTaskGetTickCount() < deadline) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    {   /* HCI LE Test End */
+        uint8_t pkt[4] = { 0x01,
+                           (uint8_t)(FCC_HCI_LE_TEST_END & 0xFF),
+                           (uint8_t)(FCC_HCI_LE_TEST_END >> 8),
+                           0x00 };
+        fcc_hci_send(pkt, sizeof(pkt));
+    }
+    vTaskDelay(pdMS_TO_TICKS(150));
+    ESP_LOGW(TAG, "FCC: DTM stopped (%s)", fcc_stop_req ? "magnet tap" : "duration elapsed");
+
+disable:
+    esp_bt_controller_disable();
+deinit:
+    esp_bt_controller_deinit();
+restore:
+    fcc_dtm_active = false;
+    fcc_stop_req   = false;
+    vTaskDelay(pdMS_TO_TICKS(300));
+    ble_stack_init();                      /* advertise again — no power cycle */
+    ESP_LOGW(TAG, "FCC: BLE restored — reconnect to reconfigure");
+}
+
+static void fcc_task(void *param) {
+    (void)param;
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (fcc_start_req) {
+            fcc_start_req = false;
+            fcc_dtm_run();
+        }
+    }
+}
+#endif /* FCC_TEST_BUILD */
+
 static void ota_task(void *param) {
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -4375,6 +4563,51 @@ static void process_command(uint8_t *data, uint16_t len) {
             ESP_LOGI(TAG, "On-disconnect: %s (saved)",
                      dc_behavior ? "fail clear" : "continue");
             break;
+
+#if FCC_TEST_BUILD
+        /* ── FCC TEST MODE (FCC build only) ────────────────── */
+        case 0xAE:  /* Set DTM channel. arg = RF/PHY channel 0-39
+                     * (freq = 2402 + 2*ch). FCC set: 0=2402, 19=2440, 39=2480. */
+            if (arg > 39) arg = 39;
+            fcc_channel = arg;
+            ble_log("FCC: channel %u = %lu MHz", (unsigned)arg, (unsigned long)fcc_mhz_of(arg));
+            ESP_LOGI(TAG, "FCC: channel %u (%lu MHz)", (unsigned)arg, (unsigned long)fcc_mhz_of(arg));
+            break;
+
+        case 0xAF:  /* Set TX power. arg = esp_power_level_t 0..7
+                     * (N12..P9 = -12..+9 dBm, 3 dB apart — ESP32 has no finer
+                     * step; see the FCC TEST MODE block). Applies to normal BLE
+                     * immediately and to the next DTM run. */
+            if (arg > ESP_PWR_LVL_P9) arg = ESP_PWR_LVL_P9;
+            fcc_pwr_lvl = arg;
+            esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, (esp_power_level_t)arg);
+            ble_log("FCC: tx power %+d dBm (level %u/7)", fcc_dbm_of(arg), (unsigned)arg);
+            ESP_LOGI(TAG, "FCC: tx power %+d dBm", fcc_dbm_of(arg));
+            break;
+
+        case 0xBB:  /* START DTM for arg minutes (1-60, 0 = default 12).
+                     * Deferred to fcc_task: this handler runs in the NimBLE
+                     * host task and the teardown calls nimble_port_stop(),
+                     * which would deadlock if called from here. The link drops
+                     * as soon as the teardown runs — that is expected. */
+            if (fcc_dtm_active) { ble_log("FCC: DTM already running"); break; }
+            if (arg == 0) arg = FCC_DEFAULT_MINUTES;
+            if (arg > 60) arg = 60;
+            fcc_minutes = arg;
+            ble_log("FCC: DTM starting ch%u %lu MHz %+d dBm %u min PRBS9/37 — link drops now",
+                    (unsigned)fcc_channel, (unsigned long)fcc_mhz_of(fcc_channel),
+                    fcc_dbm_of(fcc_pwr_lvl), (unsigned)arg);
+            fcc_start_req = true;
+            if (fcc_task_handle) xTaskNotifyGive(fcc_task_handle);
+            break;
+
+        case 0xC6:  /* Report current FCC state (human-readable, 0xF1 frames). */
+            ble_log("FCC state: ch%u %lu MHz, %+d dBm (lvl %u/7), %u min, DTM %s",
+                    (unsigned)fcc_channel, (unsigned long)fcc_mhz_of(fcc_channel),
+                    fcc_dbm_of(fcc_pwr_lvl), (unsigned)fcc_pwr_lvl, (unsigned)fcc_minutes,
+                    fcc_dtm_active ? "RUNNING" : "idle");
+            break;
+#endif /* FCC_TEST_BUILD */
 
         /* ── MODE SWITCHING ────────────────────────────────── */
         case 0xA5:  /* Enter STATIC mode */
@@ -6850,6 +7083,13 @@ void app_main(void) {
 
     /* Create OTA task (deferred OTA ops — esp_ota_begin/end block too long for BLE callback) */
     xTaskCreate(ota_task, "ota_task", 8192, NULL, 5, &ota_task_handle);
+#if FCC_TEST_BUILD
+    /* FCC build only. Priority 5 (same as ota_task): it must be able to tear
+     * the BLE stack down without the host task in the way. 4096 is ample — it
+     * only drives VHCI and sleeps. */
+    xTaskCreate(fcc_task, "fcc_task", 4096, NULL, 5, &fcc_task_handle);
+    ESP_LOGW(TAG, "*** FCC TEST BUILD — DTM opcodes AE/AF/BB/C6 active ***");
+#endif
 
 #if PPG_TEST_BUILD
     /* v4.12.0 PPG_TEST_BUILD: hall_task NOT started. No gesture polling,
