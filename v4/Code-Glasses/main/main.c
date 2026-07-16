@@ -1634,7 +1634,9 @@
 #endif
 
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.15.9-FCC-TEST"
+/* Bumped independently of production: the FCC build gained the DTM lens pulse
+ * in 4.15.10 while production is untouched at 4.15.9. */
+#define FIRMWARE_VERSION "4.15.10-FCC-TEST"
 #else
 #define FIRMWARE_VERSION "4.15.9-lens-config"
 #endif
@@ -2697,6 +2699,7 @@ static volatile int32_t lens_fine_raw = -1;
 #define FCC_DTM_PAYLOAD_PRBS9   0x00   /* standard modulated FCC pattern */
 #define FCC_DTM_LEN             37     /* max payload → highest duty cycle */
 #define FCC_DEFAULT_MINUTES     12
+#define FCC_LENS_PULSE_MS       1000   /* lens square wave during DTM: 1s on/1s off */
 #define FCC_HCI_LE_TX_TEST      0x201E
 #define FCC_HCI_LE_TEST_END     0x201F
 
@@ -4360,6 +4363,11 @@ static void ota_do_cancel(void) {
  * TX POWER: ESP32 exposes 8 levels 3 dB apart (ESP_PWR_LVL_N12..P9 = -12..+9).
  * 1 dB steps are NOT possible on this silicon — esp_bt.h documents that asking
  * for +7 yields +9. The UI therefore offers exactly these 8 levels.
+ *
+ * LENS (v4.15.10): pulsed 1 s on / 1 s off for the duration of the run. It is
+ * the only indication DTM is live — there is no BLE link to query — and it
+ * keeps the lens AC drive active so the DUT radiates as it does in use. The
+ * first cut parked the lens clear, which read as "nothing happens".
  ******************************************************************************/
 /* State, constants and the unit helpers live up with the other globals (see
  * "FCC TEST STATE") because hall_task — which sits above this block — reads
@@ -4389,15 +4397,39 @@ static void fcc_dtm_run(void) {
     uint8_t ch  = fcc_channel;
     uint8_t lvl = fcc_pwr_lvl;
     uint8_t min = fcc_minutes ? fcc_minutes : FCC_DEFAULT_MINUTES;
+    uint32_t saved_session_ms;
 
     ESP_LOGW(TAG, "FCC: DTM start ch%u (%lu MHz) %+d dBm for %u min",
              (unsigned)ch, (unsigned long)fcc_mhz_of(ch), fcc_dbm_of(lvl), (unsigned)min);
 
-    /* Stop the lens so the DUT isn't also driving the electrochromic AC
-     * during an emissions measurement. */
+    /* v4.15.10: pulse the lens 1 s on / 1 s off for the whole run instead of
+     * parking it clear. Two reasons: it is the ONLY sign DTM is live (there is
+     * no BLE link to ask), and it keeps the lens AC drive running so the DUT
+     * radiates the way it does in normal use rather than sitting idle.
+     *
+     * Driven by writing effective_duty directly from the hold loop below —
+     * NOT via lens_apply_static(), which would route through the A0/A1
+     * smoothing glide and round the edges off the square wave depending on
+     * knob settings. Clearing lens_glide_active + lens_fine_raw keeps
+     * led_task's STATIC branch and the fine-PWM ISR override from fighting
+     * those writes.
+     *
+     * The session state below is load-bearing, not defensive noise:
+     *   - drive_timer_cb force-zeros effective_duty every 100 us while
+     *     !session_active, which would flatten the pulse outright;
+     *   - led_task exits its loop and clears session_active on session
+     *     expiry, which would kill the lens partway through a long run.
+     * So restart the session clock and make sure it outlasts the test. The
+     * original duration is restored on exit; it is runtime-only either way
+     * (NVS is untouched unless 0xA4 is written). */
     strobe_stop();
     led_mode = LED_MODE_STATIC;
-    lens_apply_static(0);
+    lens_glide_active = false;
+    lens_fine_raw     = -1;
+    saved_session_ms   = session_duration_ms;
+    session_duration_ms = ((uint32_t)min + 2u) * 60000u;
+    session_start_tick  = xTaskGetTickCount();
+    session_active      = true;
 
     /* Let the "link dropping" 0xF1 frame the handler just queued actually go
      * out before we tear the host down, so the app's report box shows why it
@@ -4429,11 +4461,23 @@ static void fcc_dtm_run(void) {
     fcc_dtm_active = true;
     ESP_LOGW(TAG, "FCC: TRANSMITTING — BLE link is down by design");
 
-    {   /* Hold for the duration, or until a magnet tap sets fcc_stop_req. */
-        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)min * 60000u);
+    {   /* Hold for the duration, or until a magnet tap sets fcc_stop_req,
+         * pulsing the lens 1 s on / 1 s off the whole time so the operator can
+         * see the test is live. next_edge advances by a fixed period rather
+         * than from "now" so the mark/space stays square and doesn't drift
+         * with the 20 ms poll. */
+        TickType_t deadline  = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)min * 60000u);
+        TickType_t next_edge = xTaskGetTickCount();
+        bool lens_on = false;
         while (!fcc_stop_req && xTaskGetTickCount() < deadline) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            if ((int32_t)(xTaskGetTickCount() - next_edge) >= 0) {
+                lens_on = !lens_on;
+                effective_duty = lens_on ? 100 : 0;   /* square: no glide path */
+                next_edge += pdMS_TO_TICKS(FCC_LENS_PULSE_MS);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
+        effective_duty = 0;                            /* don't leave it dark */
     }
 
     {   /* HCI LE Test End */
@@ -4453,6 +4497,8 @@ deinit:
 restore:
     fcc_dtm_active = false;
     fcc_stop_req   = false;
+    effective_duty = 0;                    /* lens clear once the run is over */
+    session_duration_ms = saved_session_ms;/* undo the DTM session extension */
     vTaskDelay(pdMS_TO_TICKS(300));
     ble_stack_init();                      /* advertise again — no power cycle */
     ESP_LOGW(TAG, "FCC: BLE restored — reconnect to reconfigure");
