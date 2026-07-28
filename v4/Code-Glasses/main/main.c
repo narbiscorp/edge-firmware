@@ -1633,11 +1633,16 @@
 #define FCC_TEST_BUILD 0
 #endif
 
-/* v4.15.11: lens-config writes (A0/A1/A3) now confirm over BLE so a client can
- * see the applied value. Both builds carry it; the FCC build also has the DTM
- * lens pulse (4.15.10). */
+/* v4.15.12 (FCC build only): DTM safety + heat fixes for the radiated FCC
+ * setup. (1) The 4.15.10 lens indicator drove the electrochromic cell to full
+ * for half of every run — replaced with a brief dim blink to cut heat. (2) A
+ * DTM run now always ends in a reboot instead of a soft ble_stack_init(), and
+ * an independent esp_timer forces that reboot if the run overruns — so the unit
+ * can never be left transmitting-but-undetectable (the field symptom). The
+ * production build is untouched (every edit is under #if FCC_TEST_BUILD), so it
+ * stays 4.15.11-lens-config. */
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.15.11-FCC-TEST"
+#define FIRMWARE_VERSION "4.15.12-FCC-TEST"
 #else
 #define FIRMWARE_VERSION "4.15.11-lens-config"
 #endif
@@ -2700,7 +2705,14 @@ static volatile int32_t lens_fine_raw = -1;
 #define FCC_DTM_PAYLOAD_PRBS9   0x00   /* standard modulated FCC pattern */
 #define FCC_DTM_LEN             37     /* max payload → highest duty cycle */
 #define FCC_DEFAULT_MINUTES     12
-#define FCC_LENS_PULSE_MS       1000   /* lens square wave during DTM: 1s on/1s off */
+/* v4.15.12: lens "test is live" indicator. Was a 1s-on/1s-off full-drive
+ * (duty 100) square wave, which loaded the electrochromic driver hard and added
+ * avoidable heat over a long radiated run. Now a brief, dim blink — duty
+ * FCC_LENS_BLINK_DUTY for FCC_LENS_BLINK_ON_MS once per FCC_LENS_BLINK_PERIOD_MS
+ * (~25x less lens-drive energy) — still an obvious sign of life. */
+#define FCC_LENS_BLINK_DUTY      30    /* dim (was 100) */
+#define FCC_LENS_BLINK_ON_MS     200   /* brief on-time (was 1000) */
+#define FCC_LENS_BLINK_PERIOD_MS 3000  /* full blink period */
 #define FCC_HCI_LE_TX_TEST      0x201E
 #define FCC_HCI_LE_TEST_END     0x201F
 
@@ -2711,6 +2723,7 @@ static volatile bool    fcc_dtm_active = false;
 static volatile bool    fcc_stop_req   = false;
 static volatile bool    fcc_start_req  = false;
 static TaskHandle_t     fcc_task_handle = NULL;
+static esp_timer_handle_t fcc_watchdog  = NULL;  /* v4.15.12: independent DTM hard cutoff */
 
 /* ESP_PWR_LVL_N12(0) → -12 dBm ... ESP_PWR_LVL_P9(7) → +9 dBm, 3 dB apart. */
 static inline int fcc_dbm_of(uint8_t lvl) { return -12 + 3 * (int)lvl; }
@@ -4365,10 +4378,10 @@ static void ota_do_cancel(void) {
  * 1 dB steps are NOT possible on this silicon — esp_bt.h documents that asking
  * for +7 yields +9. The UI therefore offers exactly these 8 levels.
  *
- * LENS (v4.15.10): pulsed 1 s on / 1 s off for the duration of the run. It is
- * the only indication DTM is live — there is no BLE link to query — and it
- * keeps the lens AC drive active so the DUT radiates as it does in use. The
- * first cut parked the lens clear, which read as "nothing happens".
+ * LENS (v4.15.12): a brief dim blink (was a 1 s on / 1 s off full-drive square
+ * wave in 4.15.10, which loaded the electrochromic driver hard and added heat
+ * over a long radiated run). Still the only sign DTM is live — there is no BLE
+ * link to query — but at a fraction of the lens-drive energy.
  ******************************************************************************/
 /* State, constants and the unit helpers live up with the other globals (see
  * "FCC TEST STATE") because hall_task — which sits above this block — reads
@@ -4393,41 +4406,63 @@ static void fcc_hci_send(uint8_t *pkt, uint16_t len) {
     esp_vhci_host_send_packet(pkt, len);
 }
 
+/* v4.15.12: independent hard cutoff for DTM. Runs off the esp_timer service,
+ * not fcc_task, so it fires even if fcc_task is wedged (a stuck controller
+ * teardown, a VHCI that never drains, a hung HCI send). A reboot returns the
+ * unit to normal, detectable, non-transmitting behaviour — DTM state is
+ * volatile, so there is nothing to clear. This is the backstop that the radio
+ * can never be left keyed with no way to stop it but a manual power cycle. */
+static void fcc_watchdog_cb(void *arg) {
+    (void)arg;
+    ESP_LOGE(TAG, "FCC: watchdog fired — DTM overran, forcing reboot");
+    esp_restart();
+}
+
 /* Runs ONLY in fcc_task context (never the BLE host task). */
 static void fcc_dtm_run(void) {
     uint8_t ch  = fcc_channel;
     uint8_t lvl = fcc_pwr_lvl;
     uint8_t min = fcc_minutes ? fcc_minutes : FCC_DEFAULT_MINUTES;
-    uint32_t saved_session_ms;
 
     ESP_LOGW(TAG, "FCC: DTM start ch%u (%lu MHz) %+d dBm for %u min",
              (unsigned)ch, (unsigned long)fcc_mhz_of(ch), fcc_dbm_of(lvl), (unsigned)min);
 
-    /* v4.15.10: pulse the lens 1 s on / 1 s off for the whole run instead of
-     * parking it clear. Two reasons: it is the ONLY sign DTM is live (there is
-     * no BLE link to ask), and it keeps the lens AC drive running so the DUT
-     * radiates the way it does in normal use rather than sitting idle.
+    /* v4.15.12: arm the independent cutoff BEFORE touching the stack, so it
+     * covers teardown, setup, the hold loop, and LE_TEST_END. Duration + 60 s
+     * slack; the normal path reboots well before it, so it only fires if
+     * something below wedges. */
+    if (!fcc_watchdog) {
+        const esp_timer_create_args_t wa = { .callback = fcc_watchdog_cb, .name = "fcc_wdt" };
+        esp_timer_create(&wa, &fcc_watchdog);
+    }
+    if (fcc_watchdog) {
+        esp_timer_stop(fcc_watchdog);                      /* clear any prior arm */
+        esp_timer_start_once(fcc_watchdog,
+                             ((uint64_t)min * 60ull + 60ull) * 1000000ull);   /* us */
+    }
+
+    /* v4.15.12: blink the lens briefly and dimly for the whole run instead of
+     * the old 1 s on / 1 s off full-drive pulse. It is still the ONLY sign DTM
+     * is live (there is no BLE link to ask), but at far less lens-drive energy.
      *
      * Driven by writing effective_duty directly from the hold loop below —
      * NOT via lens_apply_static(), which would route through the A0/A1
-     * smoothing glide and round the edges off the square wave depending on
-     * knob settings. Clearing lens_glide_active + lens_fine_raw keeps
+     * smoothing glide. Clearing lens_glide_active + lens_fine_raw keeps
      * led_task's STATIC branch and the fine-PWM ISR override from fighting
      * those writes.
      *
      * The session state below is load-bearing, not defensive noise:
      *   - drive_timer_cb force-zeros effective_duty every 100 us while
-     *     !session_active, which would flatten the pulse outright;
+     *     !session_active, which would flatten the blink outright;
      *   - led_task exits its loop and clears session_active on session
      *     expiry, which would kill the lens partway through a long run.
-     * So restart the session clock and make sure it outlasts the test. The
-     * original duration is restored on exit; it is runtime-only either way
-     * (NVS is untouched unless 0xA4 is written). */
+     * So restart the session clock and make sure it outlasts the test. It is
+     * runtime-only (NVS is untouched unless 0xA4 is written), and the run ends
+     * in a reboot anyway, so there is nothing to restore. */
     strobe_stop();
     led_mode = LED_MODE_STATIC;
     lens_glide_active = false;
     lens_fine_raw     = -1;
-    saved_session_ms   = session_duration_ms;
     session_duration_ms = ((uint32_t)min + 2u) * 60000u;
     session_start_tick  = xTaskGetTickCount();
     session_active      = true;
@@ -4442,11 +4477,11 @@ static void fcc_dtm_run(void) {
 
     esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_bt_controller_init(&cfg);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: ctrl init %s", esp_err_to_name(err)); goto restore; }
+    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: ctrl init %s", esp_err_to_name(err)); goto reboot; }
     err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: ctrl enable %s", esp_err_to_name(err)); goto deinit; }
+    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: ctrl enable %s", esp_err_to_name(err)); goto reboot; }
     err = esp_vhci_host_register_callback(&fcc_vhci_cb);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: vhci cb %s", esp_err_to_name(err)); goto disable; }
+    if (err != ESP_OK) { ESP_LOGE(TAG, "FCC: vhci cb %s", esp_err_to_name(err)); goto reboot; }
 
     /* Power must be set on the live controller, before the test starts. */
     err = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, (esp_power_level_t)lvl);
@@ -4462,26 +4497,24 @@ static void fcc_dtm_run(void) {
     fcc_dtm_active = true;
     ESP_LOGW(TAG, "FCC: TRANSMITTING — BLE link is down by design");
 
-    {   /* Hold for the duration, or until a magnet tap sets fcc_stop_req,
-         * pulsing the lens 1 s on / 1 s off the whole time so the operator can
-         * see the test is live. next_edge advances by a fixed period rather
-         * than from "now" so the mark/space stays square and doesn't drift
-         * with the 20 ms poll. */
-        TickType_t deadline  = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)min * 60000u);
-        TickType_t next_edge = xTaskGetTickCount();
-        bool lens_on = false;
+    {   /* Hold for the duration, or until a magnet tap sets fcc_stop_req.
+         * v4.15.12: show life with a brief dim blink instead of the old 1 s/1 s
+         * full-drive square wave (which added avoidable heat). phase = elapsed %
+         * period; the lens sits at FCC_LENS_BLINK_DUTY for the first
+         * FCC_LENS_BLINK_ON_MS of each period and clear the rest. Integer math
+         * only — no float in firmware. */
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)min * 60000u);
+        TickType_t t0       = xTaskGetTickCount();
         while (!fcc_stop_req && xTaskGetTickCount() < deadline) {
-            if ((int32_t)(xTaskGetTickCount() - next_edge) >= 0) {
-                lens_on = !lens_on;
-                effective_duty = lens_on ? 100 : 0;   /* square: no glide path */
-                next_edge += pdMS_TO_TICKS(FCC_LENS_PULSE_MS);
-            }
+            uint32_t elapsed_ms = (uint32_t)(xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
+            uint32_t phase_ms   = elapsed_ms % FCC_LENS_BLINK_PERIOD_MS;
+            effective_duty = (phase_ms < FCC_LENS_BLINK_ON_MS) ? FCC_LENS_BLINK_DUTY : 0;
             vTaskDelay(pdMS_TO_TICKS(20));
         }
-        effective_duty = 0;                            /* don't leave it dark */
+        effective_duty = 0;                            /* don't leave it lit */
     }
 
-    {   /* HCI LE Test End */
+    {   /* HCI LE Test End — stop the transmitter before we reset. */
         uint8_t pkt[4] = { 0x01,
                            (uint8_t)(FCC_HCI_LE_TEST_END & 0xFF),
                            (uint8_t)(FCC_HCI_LE_TEST_END >> 8),
@@ -4489,20 +4522,20 @@ static void fcc_dtm_run(void) {
         fcc_hci_send(pkt, sizeof(pkt));
     }
     vTaskDelay(pdMS_TO_TICKS(150));
-    ESP_LOGW(TAG, "FCC: DTM stopped (%s)", fcc_stop_req ? "magnet tap" : "duration elapsed");
+    ESP_LOGW(TAG, "FCC: DTM stopped (%s) — rebooting to a clean, detectable BLE stack",
+             fcc_stop_req ? "magnet tap" : "duration elapsed");
 
-disable:
-    esp_bt_controller_disable();
-deinit:
-    esp_bt_controller_deinit();
-restore:
-    fcc_dtm_active = false;
-    fcc_stop_req   = false;
-    effective_duty = 0;                    /* lens clear once the run is over */
-    session_duration_ms = saved_session_ms;/* undo the DTM session extension */
-    vTaskDelay(pdMS_TO_TICKS(300));
-    ble_stack_init();                      /* advertise again — no power cycle */
-    ESP_LOGW(TAG, "FCC: BLE restored — reconnect to reconfigure");
+reboot:
+    /* v4.15.12: end every DTM run with a full reboot instead of a soft
+     * ble_stack_init(). Re-initialising the whole BLE stack in-process after a
+     * teardown is fragile — a half-up stack is undetectable, one of the field
+     * symptoms — whereas a reboot always comes back advertising. DTM state is
+     * volatile (no boot flag) so the unit returns to normal, detectable
+     * production behaviour, and the operator reconnects anyway (the link dropped
+     * at start), so a reboot costs nothing. This also covers the error gotos
+     * above: if the controller never came up, a clean reboot is the safest exit. */
+    effective_duty = 0;
+    esp_restart();                         /* does not return */
 }
 
 static void fcc_task(void *param) {
