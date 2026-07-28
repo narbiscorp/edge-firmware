@@ -1633,12 +1633,13 @@
 #define FCC_TEST_BUILD 0
 #endif
 
+/* v4.15.11: lens-config writes (A0/A1/A3) now confirm over BLE so a client can
+ * see the applied value. Both builds carry it; the FCC build also has the DTM
+ * lens pulse (4.15.10). */
 #if FCC_TEST_BUILD
-/* Bumped independently of production: the FCC build gained the DTM lens pulse
- * in 4.15.10 while production is untouched at 4.15.9. */
-#define FIRMWARE_VERSION "4.15.10-FCC-TEST"
+#define FIRMWARE_VERSION "4.15.11-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.15.9-lens-config"
+#define FIRMWARE_VERSION "4.15.11-lens-config"
 #endif
 static const char *TAG = "SG_v4.14.39";
 
@@ -4606,6 +4607,12 @@ static void process_command(uint8_t *data, uint16_t len) {
         case 0xA0:  /* Lens smoothing time constant (×10ms, 0=off) */
             lens_smooth_tau = arg;
             prefs_set_u8(KEY_SMOOTH_TAU, arg);
+            /* v4.15.11: confirm over BLE (0xF1), not just serial, so the app's
+             * report box shows the applied value — the only way a client can
+             * verify a write landed (there is no config readback). */
+            if (arg) ble_log("Lens smoothing: tau=%ums (level %u)",
+                             (unsigned)arg * 10, (unsigned)arg);
+            else     ble_log("Lens smoothing: off");
             ESP_LOGI(TAG, "Lens smoothing: tau=%dms (saved)", (int)arg * 10);
             break;
 
@@ -4613,12 +4620,15 @@ static void process_command(uint8_t *data, uint16_t len) {
             if (arg > 100) arg = 100;
             lens_slew_cfg = arg;
             prefs_set_u8(KEY_SLEW_MAX, arg);
+            if (arg) ble_log("Lens max rate: %u%%/100ms", (unsigned)arg);
+            else     ble_log("Lens max rate: unlimited");
             ESP_LOGI(TAG, "Lens slew cap: %d%%/100ms (saved)", arg);
             break;
 
         case 0xA3:  /* On-disconnect behavior: 0=continue program, 1=fail clear */
             dc_behavior = (arg > 1) ? 1 : arg;
             prefs_set_u8(KEY_DC_BEHAV, dc_behavior);
+            ble_log("On-disconnect: %s", dc_behavior ? "fail clear" : "continue program");
             ESP_LOGI(TAG, "On-disconnect: %s (saved)",
                      dc_behavior ? "fail clear" : "continue");
             break;
