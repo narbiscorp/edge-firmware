@@ -1633,16 +1633,18 @@
 #define FCC_TEST_BUILD 0
 #endif
 
-/* v4.15.12 (FCC build only): DTM safety + heat fixes for the radiated FCC
- * setup. (1) The 4.15.10 lens indicator drove the electrochromic cell to full
- * for half of every run — replaced with a brief dim blink to cut heat. (2) A
- * DTM run now always ends in a reboot instead of a soft ble_stack_init(), and
- * an independent esp_timer forces that reboot if the run overruns — so the unit
- * can never be left transmitting-but-undetectable (the field symptom). The
- * production build is untouched (every edit is under #if FCC_TEST_BUILD), so it
- * stays 4.15.11-lens-config. */
+/* v4.15.13 (FCC build only): make the "DTM is live" lens indicator bold and
+ * unmistakable — a full-drive double-flash every 2 s. (4.15.12 had tried a dim
+ * 30%/200ms blink to save heat, but it was invisible on the electrochromic
+ * lens; lens heat is negligible per bench observation, so drive it hard.) The
+ * 4.15.12 broadcast/detection fixes are retained: a DTM run always ends in a
+ * reboot instead of a soft ble_stack_init(), and an independent esp_timer
+ * forces that reboot if the run overruns — so the unit can never be left
+ * transmitting-but-undetectable (the field symptom). The production build is
+ * untouched (every edit is under #if FCC_TEST_BUILD), so it stays
+ * 4.15.11-lens-config. */
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.15.12-FCC-TEST"
+#define FIRMWARE_VERSION "4.15.13-FCC-TEST"
 #else
 #define FIRMWARE_VERSION "4.15.11-lens-config"
 #endif
@@ -2705,14 +2707,22 @@ static volatile int32_t lens_fine_raw = -1;
 #define FCC_DTM_PAYLOAD_PRBS9   0x00   /* standard modulated FCC pattern */
 #define FCC_DTM_LEN             37     /* max payload → highest duty cycle */
 #define FCC_DEFAULT_MINUTES     12
-/* v4.15.12: lens "test is live" indicator. Was a 1s-on/1s-off full-drive
- * (duty 100) square wave, which loaded the electrochromic driver hard and added
- * avoidable heat over a long radiated run. Now a brief, dim blink — duty
- * FCC_LENS_BLINK_DUTY for FCC_LENS_BLINK_ON_MS once per FCC_LENS_BLINK_PERIOD_MS
- * (~25x less lens-drive energy) — still an obvious sign of life. */
-#define FCC_LENS_BLINK_DUTY      30    /* dim (was 100) */
-#define FCC_LENS_BLINK_ON_MS     200   /* brief on-time (was 1000) */
-#define FCC_LENS_BLINK_PERIOD_MS 3000  /* full blink period */
+/* v4.15.13: bold, unmistakable "DTM is live" lens indicator. During a run the
+ * operator has NO BLE link to check, so the lens is the ONLY sign the radio is
+ * transmitting — make it impossible to miss. A full-drive double-flash every
+ * 2 s ("dark-dark ... pause") reads as a deliberate indicator, not a breathing
+ * effect. (4.15.12 tried a dim 30%/200ms blink to save heat; it was invisible.
+ * Lens heat is negligible per bench observation — the radio dominates — so
+ * drive it hard.) Each entry is {duty %, ms}; the hold loop repeats the table.
+ * Integer math only, no float in firmware. */
+typedef struct { uint8_t duty; uint16_t ms; } fcc_blink_step_t;
+static const fcc_blink_step_t FCC_BLINK[] = {
+    { 100, 500 },   /* flash 1 — full dark */
+    {   0, 300 },   /* brief clear between the two flashes */
+    { 100, 500 },   /* flash 2 — full dark */
+    {   0, 700 },   /* pause before repeating */
+};
+#define FCC_BLINK_STEPS  (sizeof(FCC_BLINK) / sizeof(FCC_BLINK[0]))
 #define FCC_HCI_LE_TX_TEST      0x201E
 #define FCC_HCI_LE_TEST_END     0x201F
 
@@ -4378,10 +4388,10 @@ static void ota_do_cancel(void) {
  * 1 dB steps are NOT possible on this silicon — esp_bt.h documents that asking
  * for +7 yields +9. The UI therefore offers exactly these 8 levels.
  *
- * LENS (v4.15.12): a brief dim blink (was a 1 s on / 1 s off full-drive square
- * wave in 4.15.10, which loaded the electrochromic driver hard and added heat
- * over a long radiated run). Still the only sign DTM is live — there is no BLE
- * link to query — but at a fraction of the lens-drive energy.
+ * LENS (v4.15.13): a bold full-drive double-flash every 2 s ("dark-dark ...
+ * pause"). It is the only sign DTM is live — there is no BLE link to query —
+ * so it is deliberately impossible to miss. (4.15.12's dim blink saved heat but
+ * was invisible; lens heat is negligible, so this drives the cell to full.)
  ******************************************************************************/
 /* State, constants and the unit helpers live up with the other globals (see
  * "FCC TEST STATE") because hall_task — which sits above this block — reads
@@ -4441,9 +4451,10 @@ static void fcc_dtm_run(void) {
                              ((uint64_t)min * 60ull + 60ull) * 1000000ull);   /* us */
     }
 
-    /* v4.15.12: blink the lens briefly and dimly for the whole run instead of
-     * the old 1 s on / 1 s off full-drive pulse. It is still the ONLY sign DTM
-     * is live (there is no BLE link to ask), but at far less lens-drive energy.
+    /* v4.15.13: run the bold FCC_BLINK double-flash for the whole run. It is
+     * the ONLY sign DTM is live (there is no BLE link to ask), so it is driven
+     * to full and made deliberately obvious. Lens heat is negligible per bench
+     * observation, so there is no reason to hold back.
      *
      * Driven by writing effective_duty directly from the hold loop below —
      * NOT via lens_apply_static(), which would route through the A0/A1
@@ -4497,18 +4508,21 @@ static void fcc_dtm_run(void) {
     fcc_dtm_active = true;
     ESP_LOGW(TAG, "FCC: TRANSMITTING — BLE link is down by design");
 
-    {   /* Hold for the duration, or until a magnet tap sets fcc_stop_req.
-         * v4.15.12: show life with a brief dim blink instead of the old 1 s/1 s
-         * full-drive square wave (which added avoidable heat). phase = elapsed %
-         * period; the lens sits at FCC_LENS_BLINK_DUTY for the first
-         * FCC_LENS_BLINK_ON_MS of each period and clear the rest. Integer math
-         * only — no float in firmware. */
+    {   /* Hold for the duration, or until a magnet tap sets fcc_stop_req, running
+         * the bold FCC_BLINK double-flash the whole time so the operator can see
+         * the test is live (no BLE link to ask). step_end advances by fixed
+         * durations so the rhythm doesn't drift; the 20 ms poll keeps the magnet
+         * tap responsive. Integer math only — no float in firmware. */
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)min * 60000u);
-        TickType_t t0       = xTaskGetTickCount();
+        size_t     step     = 0;
+        effective_duty      = FCC_BLINK[0].duty;
+        TickType_t step_end = xTaskGetTickCount() + pdMS_TO_TICKS(FCC_BLINK[0].ms);
         while (!fcc_stop_req && xTaskGetTickCount() < deadline) {
-            uint32_t elapsed_ms = (uint32_t)(xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
-            uint32_t phase_ms   = elapsed_ms % FCC_LENS_BLINK_PERIOD_MS;
-            effective_duty = (phase_ms < FCC_LENS_BLINK_ON_MS) ? FCC_LENS_BLINK_DUTY : 0;
+            if ((int32_t)(xTaskGetTickCount() - step_end) >= 0) {
+                step = (step + 1u) % FCC_BLINK_STEPS;
+                effective_duty = FCC_BLINK[step].duty;
+                step_end += pdMS_TO_TICKS(FCC_BLINK[step].ms);
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
         }
         effective_duty = 0;                            /* don't leave it lit */
