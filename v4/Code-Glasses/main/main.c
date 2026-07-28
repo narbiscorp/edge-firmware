@@ -3473,6 +3473,14 @@ static void ppg_emit_health(void) {
     uint16_t ble_err16 = (ble_send_errors > 0xFFFF) ? 0xFFFF : (uint16_t)ble_send_errors;
     uint16_t jit_max16 = (ppg_jitter_max_us > 0xFFFF) ? 0xFFFF : (uint16_t)ppg_jitter_max_us;
     uint8_t  jit_over8 = (ppg_jitter_ticks_over > 0xFF) ? 0xFF : (uint8_t)ppg_jitter_ticks_over;
+    /* Reset the window after snapshotting so each 0xF3 reports THIS interval's
+     * jitter. The old 5 s window reset was dropped when the internal PPG was
+     * removed (the ppg_task comment still claims a per-window reset that no
+     * longer exists), leaving ppg_jitter_max_us as a boot-lifetime max-hold and
+     * ppg_jitter_ticks_over as a free-running counter — both only ever climb,
+     * so the health panel shows false "runaway jitter." */
+    ppg_jitter_max_us = 0;
+    ppg_jitter_ticks_over = 0;
 
     uint8_t pkt[22];
     pkt[0]  = 0xF3;
