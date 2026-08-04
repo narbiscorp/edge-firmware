@@ -1605,6 +1605,10 @@
 #include "esp_crc.h"
 #include "driver/gptimer.h"
 #include "driver/adc.h"     /* v4.12.0: PPG ADC input (legacy API — simple, stable) */
+#include "esp_adc_cal.h"    /* v4.16.0: battery ADC raw → millivolts (legacy cal API,
+                             * matches the legacy driver/adc.h already in use) */
+#include "esp_efuse.h"      /* v4.16.0: chip package detect (U4WDH = production PCB) */
+#include "soc/efuse_defs.h" /* v4.16.0: EFUSE_RD_CHIP_VER_PKG_ESP32U4WDH */
 #include "esp_heap_caps.h"  /* v4.12.2: health report — free heap etc. */
 #include "esp_pm.h"         /* v4.12.9: CPU frequency / power management */
 #include "soc/rtc.h"        /* v4.12.9: rtc_clk_cpu_freq_set_config fallback */
@@ -1633,13 +1637,24 @@
 #define FCC_TEST_BUILD 0
 #endif
 
-/* v4.15.11: lens-config writes (A0/A1/A3) now confirm over BLE so a client can
- * see the applied value. Both builds carry it; the FCC build also has the DTM
- * lens pulse (4.15.10). */
+/* v4.16.0: glasses-side battery monitoring — 0xFB status frame + standard BLE
+ * Battery Service (0x180F), opcode 0xC7 to poll / dump probe diagnostics.
+ *
+ * v4.16.1, two changes:
+ *   1. Battery pin corrected to the V1.2 respin spec: GPIO36 / SENSOR_VP /
+ *      ADC1_CHANNEL_0, divider 2× 1 MΩ + 100 nF. Alternates GPIO39/34/32/33
+ *      are still probed as a fallback; GPIO35 is excluded because the
+ *      PulseSensor midrail there would masquerade as a valid battery. V1.1
+ *      boards have no divider at all and correctly report unsupported.
+ *      See the GLASSES BATTERY MONITOR block.
+ *   2. Program-1 indicator pulse removed. Opening the glasses now goes
+ *      straight into the breathe program at the saved pace with no pulse;
+ *      programs 2/3 still pulse 2×/3×, and cycling back to 1 is silent.
+ *      See program_indicator(). */
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.15.11-FCC-TEST"
+#define FIRMWARE_VERSION "4.16.1-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.15.11-lens-config"
+#define FIRMWARE_VERSION "4.16.1-battery"
 #endif
 static const char *TAG = "SG_v4.14.39";
 
@@ -2175,6 +2190,28 @@ static void indicator_trigger(uint8_t count, uint32_t hold_ms) {
                       + hold_ms);
 }
 
+/* v4.16.1: the "which program am I on" indicator. Program 1 is SILENT —
+ * opening the glasses, or cycling back around to program 1, goes straight
+ * into the breathe program with no pulse. Programs 2..N still pulse N times.
+ *
+ * Why: program 1 is where every power-on lands (current_program is not
+ * persisted), so the old 1-pulse fired on literally every boot, a couple of
+ * seconds after the tint had already begun. It read as a glitch in the
+ * breathing waveform rather than as information — and a count of 1 tells the
+ * user nothing they can act on, since not tapping already means program 1.
+ * Counts only carry information once they distinguish 2 from 3.
+ *
+ * Scope: only the N-pulse program indicator. The semantic indicators keep
+ * their own fixed counts and still fire regardless of program — 5-pulse
+ * sensor handshake, 3-pulse earclip linked, 2-pulse earclip lost, 3-pulse
+ * forget-earclip.
+ *
+ * Takes the 1-based program number — the same number the user counts. */
+static void program_indicator(uint8_t program_1based) {
+    if (program_1based <= 1) return;   /* program 1 = silent */
+    indicator_trigger(program_1based, 0);
+}
+
 /* Compute current indicator duty output (0-100 percent value).
  *   = 0    when indicator is showing its baseline (clear lens)
  *   = 100  when indicator is at peak darkness
@@ -2457,6 +2494,10 @@ static uint8_t adapt_resp_quintet(void) {
 #define KEY_SMOOTH_TAU         "smth_tau"
 #define KEY_SLEW_MAX           "slew_max"
 #define KEY_DC_BEHAV           "dc_behav"
+/* v4.16.1: ADC1 channel confirmed to carry the VBAT divider. Cached after a
+ * successful probe so later boots go straight to the known-good pin instead
+ * of re-scanning. 0xFF = not yet known. Cleared by 0xC7 0x01 (reprobe). */
+#define KEY_BATT_CH            "batt_ch"
 
 /* Coherence-pipeline tuning (live-settable via 0xE0 COH_PARAMS).
  * One u8 per field for simplicity; matches the existing prefs_get_u8 path. */
@@ -2817,6 +2858,7 @@ static TaskHandle_t ota_task_handle = NULL;
  * tracked here. */
 static uint16_t status_char_handle = 0;            /* 0xFF03 val_handle */
 static uint16_t ppg_char_handle    = 0;            /* 0xFF04 val_handle */
+static uint16_t batt_bas_handle    = 0;            /* v4.16.0: 0x2A19 Battery Level val_handle */
 static uint16_t g_conn_handle      = 0xFFFF;       /* dashboard conn_handle */
 static uint8_t  g_own_addr_type    = 0;            /* set in on_ble_sync */
 static bool notifications_enabled  = false;        /* Status notifications (0xFF03) */
@@ -3393,6 +3435,352 @@ static void send_status_frame(uint8_t type, const uint8_t *payload, size_t len) 
     nimble_notify(status_char_handle, pkt, (size_t)(1 + len));
 }
 
+/*******************************************************************************
+ * GLASSES BATTERY MONITOR (v4.16.0, pin corrected v4.16.1)
+ *
+ * Reads the glasses' own battery through a resistive divider on VBAT.
+ *
+ * HARDWARE STATUS — read this before debugging a "no battery" report:
+ *
+ *   - V1.1 (every board in the field today): the divider DOES NOT EXIST.
+ *     BAT+ runs straight to the TP4057 charger and on to the TPS63802
+ *     buck-boost; nothing taps it to an ADC pin. On these units the monitor
+ *     correctly reports unsupported (mv=0, soc=0xFF, charging=0xFF). That is
+ *     the expected, correct result — not a bug to chase.
+ *   - V1.2 respin spec (board STS-USA50925-ESP32-ZZ): divider = 2× 1 MΩ 1%
+ *     0402 + 100 nF X7R on the midpoint, feeding **GPIO36 / SENSOR_VP /
+ *     physical pin 5 / ADC1_CHANNEL_0**. 3.0-4.2 V cell → 1.5-2.1 V at the
+ *     pin, ~2 µA quiescent. ADC1 only, because BLE is always on and ADC2 is
+ *     unusable while the radio runs.
+ *
+ * PIN HISTORY (so nobody "corrects" this back): the April PCB review split
+ * the two analog inputs GPIO36 → PulseSensor and GPIO39 → battery. The May
+ * standalone-battery spec narrowed scope to battery only and made GPIO36 the
+ * primary, with GPIO39/34/32/33 as alternates. This firmware runs PPG on
+ * GPIO35 (see PPG_ADC_GPIO), so GPIO36-for-battery does not collide. If a
+ * future board puts the PulseSensor back on GPIO36, the split assignment
+ * must come back and BATT_PRIMARY_CH must move to GPIO39.
+ *
+ * Pin selection at boot, in order:
+ *   1. NVS cache (KEY_BATT_CH) — a channel confirmed by an earlier probe.
+ *   2. GPIO36 (the V1.2 spec pin).
+ *   3. Alternates GPIO39/34/32/33, in that order.
+ * A candidate is accepted only if its reading is BOTH in the band a ÷2
+ * divider implies AND electrically stable (span + drift gates). The 100 nF
+ * cap makes a real divider node rock-solid; an unconnected pin drifts, so
+ * the stability gate is what keeps a floating V1.1 pin from inventing a
+ * battery reading.
+ *
+ * GPIO35 IS DELIBERATELY NOT A CANDIDATE. It carries the PulseSensor, whose
+ * ~1.65 V midrail doubles to a perfectly plausible 3.3 V "battery" — a
+ * guaranteed false positive. Never add it to the candidate list.
+ *
+ * Reporting, once per BATT_EMIT_PERIOD_MS and immediately on subscribe /
+ * 0xC7 poll:
+ *   - 0xFB status frame on 0xFF03, payload identical in layout to the 0xF8
+ *     earclip relay: [mv u16 LE][soc u8][charging u8]. soc 0xFF = unknown/
+ *     unsupported; charging 0xFF = unknown.
+ *   - Standard BLE Battery Service 0x180F / Battery Level 0x2A19
+ *     (read + notify, 0-100; reads 0 while unknown) so the BrainMaster
+ *     bridge, nRF Connect, and any generic client see battery with zero
+ *     custom protocol work.
+ *
+ * charging is a best-effort slope heuristic (the TP4057's CHRG/STDBY pins
+ * drive indicator LEDs only — they have no route to the MCU): smoothed VBAT
+ * rising ≥ +20 mV over the 90 s lookback → 1, falling → 0, else hold.
+ *
+ * The earclip is a different device entirely (XIAO ESP32-C6, GPIO-switched
+ * divider ground leg). None of this applies to it; its battery arrives
+ * pre-computed over the relay as 0xF8.
+ ******************************************************************************/
+#define BATT_FRAME_TYPE         0xFB
+#define BATT_DIVIDER_NUM        2u          /* VBAT = pin_mv × 2 (both legs 1 MΩ) */
+#define BATT_SAMPLE_PERIOD_MS   10000
+#define BATT_EMIT_PERIOD_MS     30000
+#define BATT_SOC_UNKNOWN        0xFF
+#define BATT_CHG_UNKNOWN        0xFF
+#define BATT_PROBE_CANDIDATES   5
+#define BATT_PIN_MV_MIN         1400        /* VBAT 2.8 V through the ÷2 divider */
+#define BATT_PIN_MV_MAX         2250        /* VBAT 4.5 V through the ÷2 divider */
+#define BATT_PROBE_SPAN_MAX_MV  30          /* max p-p across median window */
+#define BATT_PROBE_DRIFT_MAX_MV 20          /* max median drift across 400 ms */
+#define BATT_CHG_RISE_MV        20          /* smoothed rise over lookback → charging */
+#define BATT_CHG_LOOKBACK       9           /* ring slots × 10 s sample = 90 s */
+
+/* GPIO36 / SENSOR_VP / pin 5 — the V1.2 respin spec pin. */
+#define BATT_PRIMARY_CH         ADC1_CHANNEL_0
+
+/* Candidate order: spec pin first, then the documented alternates.
+ * GPIO35 is absent on purpose — see the block comment above. */
+static const adc1_channel_t BATT_PROBE_CH[BATT_PROBE_CANDIDATES] = {
+    ADC1_CHANNEL_0,  /* GPIO36 — V1.2 spec */
+    ADC1_CHANNEL_3,  /* GPIO39 — April-review alternate */
+    ADC1_CHANNEL_6,  /* GPIO34 */
+    ADC1_CHANNEL_4,  /* GPIO32 */
+    ADC1_CHANNEL_5,  /* GPIO33 */
+};
+static const uint8_t BATT_PROBE_GPIO[BATT_PROBE_CANDIDATES] = {
+    36, 39, 34, 32, 33,
+};
+
+static esp_adc_cal_characteristics_t batt_adc_chars;
+static bool     batt_supported = false;
+static int8_t   batt_ch        = -1;               /* adc1_channel_t once found */
+static uint8_t  batt_gpio      = 0;                /* GPIO of batt_ch, 0 = none */
+static uint16_t batt_mv        = 0;                /* smoothed VBAT millivolts */
+static uint8_t  batt_soc       = BATT_SOC_UNKNOWN;
+static uint8_t  batt_charging  = BATT_CHG_UNKNOWN;
+static uint16_t batt_probe_result_mv[BATT_PROBE_CANDIDATES];  /* pin mV, last probe */
+static uint16_t batt_chg_ring[BATT_CHG_LOOKBACK];  /* smoothed mv history, 10 s apart */
+static uint8_t  batt_chg_ring_n = 0;               /* valid entries (fills once) */
+static TaskHandle_t batt_task_handle = NULL;
+/* 0xC7 0x01 sets this; batt_task picks it up on its next wake. The probe
+ * blocks for seconds, so it must NOT run in the NimBLE host task where
+ * process_command executes (same deadlock class as the FCC 0xBB deferral). */
+static volatile bool batt_reprobe_req = false;
+
+/* Median-of-9 pin reading in calibrated millivolts, plus p-p span of the
+ * window. Same insertion-sort trick as ppg_read_oversampled. */
+static uint16_t batt_read_pin_mv(adc1_channel_t ch, uint16_t *span_mv) {
+    uint16_t v[9];
+    for (int i = 0; i < 9; i++) {
+        int r = adc1_get_raw(ch);
+        if (r < 0) r = 0;
+        v[i] = (uint16_t)esp_adc_cal_raw_to_voltage((uint32_t)r, &batt_adc_chars);
+        int j = i;
+        while (j > 0 && v[j - 1] > v[j]) {
+            uint16_t t = v[j]; v[j] = v[j - 1]; v[j - 1] = t;
+            j--;
+        }
+        vTaskDelay(pdMS_TO_TICKS(3));
+    }
+    if (span_mv) *span_mv = (uint16_t)(v[8] - v[0]);
+    return v[4];
+}
+
+/* LiPo open-circuit-ish voltage → state of charge, light load (~20-40 mA).
+ * Linear interpolation between anchor points. */
+static uint8_t batt_soc_of_mv(uint16_t mv) {
+    static const struct { uint16_t mv; uint8_t pct; } curve[] = {
+        {4200, 100}, {4100, 92}, {4000, 80}, {3930, 68}, {3870, 58},
+        {3820, 49},  {3770, 40}, {3720, 31}, {3680, 24}, {3630, 17},
+        {3580, 11},  {3500, 6},  {3400, 3},  {3300, 1},  {3200, 0},
+    };
+    const int n = sizeof(curve) / sizeof(curve[0]);
+    if (mv >= curve[0].mv)     return 100;
+    if (mv <= curve[n - 1].mv) return 0;
+    for (int i = 1; i < n; i++) {
+        if (mv >= curve[i].mv) {
+            uint16_t hi_mv = curve[i - 1].mv, lo_mv = curve[i].mv;
+            uint8_t  hi_p  = curve[i - 1].pct, lo_p = curve[i].pct;
+            return (uint8_t)(lo_p + (uint32_t)(mv - lo_mv) * (hi_p - lo_p) / (hi_mv - lo_mv));
+        }
+    }
+    return 0;
+}
+
+/* Probe one candidate channel: in-band + stable now, still there and
+ * unmoved 400 ms later. Records the first-pass reading for diagnostics. */
+static bool batt_probe_channel(int idx) {
+    adc1_channel_t ch = BATT_PROBE_CH[idx];
+    ESP_ERROR_CHECK(adc1_config_channel_atten(ch, ADC_ATTEN_DB_12));
+    uint16_t span1 = 0, span2 = 0;
+    uint16_t m1 = batt_read_pin_mv(ch, &span1);
+    batt_probe_result_mv[idx] = m1;
+    if (m1 < BATT_PIN_MV_MIN || m1 > BATT_PIN_MV_MAX) return false;
+    if (span1 > BATT_PROBE_SPAN_MAX_MV) return false;
+    vTaskDelay(pdMS_TO_TICKS(400));
+    uint16_t m2 = batt_read_pin_mv(ch, &span2);
+    if (m2 < BATT_PIN_MV_MIN || m2 > BATT_PIN_MV_MAX) return false;
+    if (span2 > BATT_PROBE_SPAN_MAX_MV) return false;
+    uint16_t drift = (m1 > m2) ? (m1 - m2) : (m2 - m1);
+    if (drift > BATT_PROBE_DRIFT_MAX_MV) return false;
+    return true;
+}
+
+/* Mark the battery monitor unsupported and reset every derived value, so a
+ * failed (re)probe can never leave a stale reading visible to a client. */
+static void batt_mark_unsupported(void) {
+    batt_supported = false;
+    batt_ch        = -1;
+    batt_gpio      = 0;
+    batt_mv        = 0;
+    batt_soc       = BATT_SOC_UNKNOWN;
+    batt_charging  = BATT_CHG_UNKNOWN;
+    batt_chg_ring_n = 0;
+}
+
+/* Accept candidate `idx` as the divider pin. */
+static void batt_accept(int idx) {
+    batt_ch   = (int8_t)BATT_PROBE_CH[idx];
+    batt_gpio = BATT_PROBE_GPIO[idx];
+    batt_supported = true;
+    prefs_set_u8(KEY_BATT_CH, (uint8_t)batt_ch);
+    ESP_LOGI(TAG, "Battery divider on GPIO%u (ADC1_CH%d): pin %u mV -> VBAT %u mV%s",
+             batt_gpio, (int)batt_ch, batt_probe_result_mv[idx],
+             batt_probe_result_mv[idx] * BATT_DIVIDER_NUM,
+             (BATT_PROBE_CH[idx] == BATT_PRIMARY_CH) ? " (V1.2 spec pin)" : " (ALTERNATE)");
+}
+
+/* Full probe pass: spec pin first, then the documented alternates. Returns
+ * true if a divider channel was found. Every candidate is measured even
+ * after a hit so the 0xC7 0x01 diagnostic dump shows the whole picture. */
+static bool batt_probe(void) {
+    int hit = -1;
+    for (int i = 0; i < BATT_PROBE_CANDIDATES; i++) {
+        if (batt_probe_channel(i) && hit < 0) hit = i;
+    }
+    if (hit >= 0) {
+        batt_accept(hit);
+        return true;
+    }
+    batt_mark_unsupported();
+    ESP_LOGW(TAG, "No VBAT divider found (GPIO36/39/34/32/33) — expected on V1.1 "
+                  "boards, which have no divider fitted. Battery reports unsupported.");
+    return false;
+}
+
+/* Emit the 0xFB frame (and push the BAS characteristic). Safe to call from
+ * any task; send_status_frame gates on connection + subscription itself and
+ * ble_gatts_chr_updated no-ops without a subscribed client. */
+static void batt_emit_frame(void) {
+    uint8_t payload[4];
+    payload[0] = (uint8_t)(batt_mv & 0xFF);
+    payload[1] = (uint8_t)((batt_mv >> 8) & 0xFF);
+    payload[2] = batt_soc;
+    payload[3] = batt_charging;
+    send_status_frame(BATT_FRAME_TYPE, payload, sizeof(payload));
+    if (batt_bas_handle != 0 && batt_soc != BATT_SOC_UNKNOWN) {
+        ble_gatts_chr_updated(batt_bas_handle);
+    }
+}
+
+/* One human-readable line for the dashboard log — used on subscribe and by
+ * the 0xC7 poll so a person can read battery state without a parser. */
+static void batt_ble_log_state(void) {
+    if (batt_supported) {
+        ble_log("batt: %u mV soc=%u%% chg=%u (gpio%u)",
+                (unsigned)batt_mv, (unsigned)batt_soc, (unsigned)batt_charging,
+                (unsigned)batt_gpio);
+    } else {
+        ble_log("batt: unsupported (no VBAT divider — expected on V1.1)");
+    }
+}
+
+/* Battery task. Priority 1 — nothing here is time-critical, and every ADC
+ * touch goes through the legacy driver's internal ADC1 lock, so coexisting
+ * with ppg_task's 50 Hz reads is safe (same pattern the old 0xC0 ADC scan
+ * diagnostic used). */
+static void batt_task(void *arg) {
+    (void)arg;
+    /* Let boot + BLE bring-up settle before hogging the ADC lock. */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    /* Package is logged for diagnostics only. It is NOT a gate: the pin is
+     * specified (GPIO36) and GPIO35 is excluded from the candidate list, so
+     * an old dev board simply fails the band/stability gates and reports
+     * unsupported. Gating on the package would only risk a false negative on
+     * a production unit whose efuse reads something unexpected. */
+    ESP_LOGI(TAG, "Battery: chip pkg %lu (U4WDH=%d)",
+             (unsigned long)esp_efuse_get_pkg_ver(), EFUSE_RD_CHIP_VER_PKG_ESP32U4WDH);
+
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12,
+                             1100, &batt_adc_chars);
+
+    /* Fast path: a previous boot already confirmed the channel. Re-verify it
+     * (cheap) rather than trusting NVS blindly — a cached pin from a
+     * different board or a stale entry must not produce fake readings. */
+    uint8_t cached = prefs_get_u8(KEY_BATT_CH, 0xFF);
+    bool located = false;
+    if (cached != 0xFF) {
+        for (int i = 0; i < BATT_PROBE_CANDIDATES; i++) {
+            if ((uint8_t)BATT_PROBE_CH[i] == cached) {
+                if (batt_probe_channel(i)) {
+                    batt_accept(i);
+                    located = true;
+                }
+                break;
+            }
+        }
+        if (!located) {
+            ESP_LOGW(TAG, "Battery: cached channel %u no longer valid — full reprobe", cached);
+        }
+    }
+    if (!located) located = batt_probe();
+
+    if (located) {
+        /* Seed the smoothed value so the first emit is real. */
+        batt_mv  = batt_read_pin_mv((adc1_channel_t)batt_ch, NULL) * BATT_DIVIDER_NUM;
+        batt_soc = batt_soc_of_mv(batt_mv);
+        batt_charging = 0;
+    }
+
+    uint32_t last_emit_ms = 0;
+    while (1) {
+        if (batt_reprobe_req) {
+            /* Deferred 0xC7 0x01 diagnostic: drop the cached pin, re-run the
+             * full probe, and dump every candidate's reading (pin-side mV) so
+             * a bench tester can see exactly what each ADC input is doing. */
+            batt_reprobe_req = false;
+            prefs_set_u8(KEY_BATT_CH, 0xFF);
+            batt_probe();
+            ble_log("probe g36=%u g39=%u g34=%u",
+                    batt_probe_result_mv[0], batt_probe_result_mv[1],
+                    batt_probe_result_mv[2]);
+            ble_log("probe g32=%u g33=%u (pin mV, x2 = VBAT)",
+                    batt_probe_result_mv[3], batt_probe_result_mv[4]);
+            if (batt_supported) {
+                batt_mv  = batt_read_pin_mv((adc1_channel_t)batt_ch, NULL) * BATT_DIVIDER_NUM;
+                batt_soc = batt_soc_of_mv(batt_mv);
+            }
+            batt_emit_frame();
+            batt_ble_log_state();
+        }
+
+        if (batt_supported) {
+            uint16_t vbat = batt_read_pin_mv((adc1_channel_t)batt_ch, NULL) * BATT_DIVIDER_NUM;
+            /* EMA alpha 1/4 per 10 s sample. */
+            batt_mv  = (uint16_t)(((uint32_t)batt_mv * 3 + vbat) / 4);
+            batt_soc = batt_soc_of_mv(batt_mv);
+
+            /* Charging heuristic: compare against the smoothed value from
+             * ~90 s ago. Ring shifts one slot per sample. */
+            if (batt_chg_ring_n == BATT_CHG_LOOKBACK) {
+                uint16_t old = batt_chg_ring[0];
+                if      (batt_mv >= old + BATT_CHG_RISE_MV) batt_charging = 1;
+                else if (batt_mv + 5 < old)                 batt_charging = 0;
+                /* else: hold previous state (plateaus near CV top-off) */
+                memmove(&batt_chg_ring[0], &batt_chg_ring[1],
+                        (BATT_CHG_LOOKBACK - 1) * sizeof(uint16_t));
+                batt_chg_ring[BATT_CHG_LOOKBACK - 1] = batt_mv;
+            } else {
+                batt_chg_ring[batt_chg_ring_n++] = batt_mv;
+            }
+        }
+
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now_ms - last_emit_ms >= BATT_EMIT_PERIOD_MS) {
+            last_emit_ms = now_ms;
+            batt_emit_frame();
+        }
+        /* Sleep one sample period, but wake immediately on a 0xC7 0x01
+         * reprobe request (xTaskNotifyGive from the NimBLE host task). */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BATT_SAMPLE_PERIOD_MS));
+    }
+}
+
+/* Battery Level 0x2A19 read callback. Reads return the current estimate
+ * (0 while unknown — the standard characteristic has no "unknown" value;
+ * clients that care use the 0xFB frame, which does). */
+static int access_batt_level_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    uint8_t v = (batt_soc == BATT_SOC_UNKNOWN) ? 0 : batt_soc;
+    int rc = os_mbuf_append(ctxt->om, &v, 1);
+    return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
 /* Ring of recent ADC reads for stats — updated by ppg_task inline,
  * summarized by ppg_emit_adc_stats() below. 25 samples = 500ms at 50Hz. */
 #define ADC_STATS_N         25
@@ -3603,7 +3991,11 @@ static void led_task(void *param) {
         if (!boot_indicator_shown &&
             xTaskGetTickCount() >= boot_indicator_due_tick) {
             if (!ppg_auto_active) {
-                indicator_trigger((uint8_t)(current_program + 1), 0);
+                /* v4.16.1: silent for program 1, which is where every boot
+                 * lands — the glasses just start breathing at the saved
+                 * pace. Only a restored/advanced program 2+ announces
+                 * itself. See program_indicator(). */
+                program_indicator((uint8_t)(current_program + 1));
             }
             boot_indicator_shown = true;
         }
@@ -4168,8 +4560,11 @@ static void hall_task(void *param) {
                     ESP_LOGI(TAG, "Hall short-tap %lums → advance to program %d",
                              held_ms, next);
                     apply_program(next);
-                    /* v4.14.2: indicator shows new program (1-based count) */
-                    indicator_trigger((uint8_t)(next + 1), 0);
+                    /* v4.14.2: indicator shows new program (1-based count).
+                     * v4.16.1: program 1 is silent — cycling back around to
+                     * it drops straight into the breathe program. See
+                     * program_indicator(). */
+                    program_indicator((uint8_t)(next + 1));
                 }
                 /* v4.14.34: refresh BLE advertising window on user interaction. */
                 if (ble_stack_up && !is_connected) {
@@ -4561,6 +4956,7 @@ static void ota_task(void *param) {
  *   0xBF  PREFS : factory reset                   (0 arg)
  *   0xC0  DEBUG : ADC scan enable/disable         (1 arg)
  *   0xC1  NARBIS: forget earclip + rescan         (0 arg) [Path B]
+ *   0xC7  BATT  : 0=emit 0xFB frame, 1=reprobe    (1 arg) [v4.16.0]
  *
  * The legacy single-byte form (len == 1) is treated as static-mode duty
  * — kept for backwards-compat with the earliest dashboard.
@@ -5050,6 +5446,22 @@ static void process_command(uint8_t *data, uint16_t len) {
             break;
         }
 
+        case 0xC7:  /* v4.16.0: glasses battery.
+                     *   arg = 0x00 → emit current 0xFB frame + one log line.
+                     *   arg = 0x01 → deferred divider reprobe + per-channel
+                     *                dump (runs in batt_task; the probe
+                     *                blocks for seconds and this handler is
+                     *                on the NimBLE host task). */
+            if (arg == 0x01) {
+                batt_reprobe_req = true;
+                if (batt_task_handle) xTaskNotifyGive(batt_task_handle);
+                ble_log("0xC7 reprobe queued");
+            } else {
+                batt_emit_frame();
+                batt_ble_log_state();
+            }
+            break;
+
         case 0xCB:  /* Set HR source. Tells the BLE central to scan/connect
                      * to the earclip (default) or pause entirely (the
                      * dashboard is forwarding H10 R-R intervals via 0xCA).
@@ -5282,6 +5694,10 @@ static const ble_uuid16_t CHR_UUID_CTRL      = BLE_UUID16_INIT(GATTS_CHAR_UUID_C
 static const ble_uuid16_t CHR_UUID_OTA       = BLE_UUID16_INIT(GATTS_CHAR_UUID_OTA);
 static const ble_uuid16_t CHR_UUID_STATUS    = BLE_UUID16_INIT(GATTS_CHAR_UUID_STATUS);
 static const ble_uuid16_t CHR_UUID_PPG       = BLE_UUID16_INIT(GATTS_CHAR_UUID_PPG);
+/* v4.16.0: standard Battery Service so generic clients (BrainMaster bridge,
+ * nRF Connect, OS battery indicators) can read battery with no custom code. */
+static const ble_uuid16_t SVC_UUID_BAS       = BLE_UUID16_INIT(0x180F);
+static const ble_uuid16_t CHR_UUID_BAS_LEVEL = BLE_UUID16_INIT(0x2A19);
 
 /* Forward decls — access callbacks are defined below the service table. */
 static int access_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -5324,11 +5740,29 @@ static const struct ble_gatt_chr_def DASHBOARD_CHRS[] = {
     { 0 }
 };
 
+/* v4.16.0: Battery Service characteristic table. Kept as a separate primary
+ * service AFTER the dashboard service so the 0xFF01-0xFF04 attribute handles
+ * are unchanged from v4.15.x — no client re-discovery surprises. */
+static const struct ble_gatt_chr_def BAS_CHRS[] = {
+    {
+        .uuid       = &CHR_UUID_BAS_LEVEL.u,
+        .access_cb  = access_batt_level_cb,
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &batt_bas_handle,
+    },
+    { 0 }
+};
+
 static const struct ble_gatt_svc_def DASHBOARD_SVCS[] = {
     {
         .type            = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid            = &SVC_UUID_DASHBOARD.u,
         .characteristics = DASHBOARD_CHRS,
+    },
+    {
+        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid            = &SVC_UUID_BAS.u,
+        .characteristics = BAS_CHRS,
     },
     { 0 }
 };
@@ -5544,6 +5978,10 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
                 ble_log("relay %s (refresh on dashboard connect)",
                         relay_up ? "linked" : "lost");
                 narbis_central_emit_diag();
+                /* v4.16.0: current glasses battery, immediately on subscribe
+                 * so a fresh client never waits out the 30 s emit period. */
+                batt_emit_frame();
+                batt_ble_log_state();
             }
         } else if (event->subscribe.attr_handle == ppg_char_handle) {
             ppg_notifications_enabled = event->subscribe.cur_notify;
@@ -7190,6 +7628,13 @@ void app_main(void) {
      * stack-like access. 6KB is generous. */
     coh_init();
     xTaskCreate(coherence_task, "coh_task", 6144, NULL, 4, NULL);
+
+    /* v4.16.0: glasses battery monitor. Priority 1 (nothing time-critical),
+     * 4096 stack — locals are small but ble_log/ESP_LOG formatting runs on
+     * this stack. Probes for the PCB1_3 VBAT divider at boot, then samples
+     * every 10 s and emits a 0xFB frame every 30 s. See GLASSES BATTERY
+     * MONITOR block. */
+    xTaskCreate(batt_task, "batt_task", 4096, NULL, 1, &batt_task_handle);
 
     /* Main loop - monitor session state and BLE idle timeout */
     while (1) {
