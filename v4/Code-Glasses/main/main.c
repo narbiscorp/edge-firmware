@@ -5022,8 +5022,15 @@ static void process_command(uint8_t *data, uint16_t len) {
         case 0xA2:  /* Set brightness / max tint */
             if (arg > 100) arg = 100;
             brightness = arg;
-            prefs_set_u8(KEY_BRIGHTNESS, arg);
-            ESP_LOGI(TAG, "Brightness: %d%% (saved)", brightness);
+            /* RAM-only: 0xA2 carries the LIVE, app-driven lens depth and is
+             * re-sent on most breaths, so a synchronous NVS commit here ran
+             * flash on the NimBLE host task every breath. Once the NVS page
+             * filled (~15 min), each commit triggered a flash-GC sector erase
+             * whose escalating interrupt-mask windows tripped the watchdog —
+             * the mid-session reboot. Brightness is a runtime value; if a
+             * remembered "max tint" preference is ever wanted, flush it once
+             * on disconnect/session-end, never on the per-breath stream. */
+            ESP_LOGI(TAG, "Brightness: %d%%", brightness);
             break;
             
         case 0xA4:  /* Set session duration */
@@ -7473,6 +7480,14 @@ static void central_log_sink(const char *msg) {
  ******************************************************************************/
 void app_main(void) {
     esp_err_t ret;
+
+    /* Reboot forensics: log WHY the chip last reset so a mid-session reboot
+     * self-identifies (ESP_RST_INT_WDT / ESP_RST_TASK_WDT = watchdog stall,
+     * ESP_RST_PANIC = assert/stack/heap, ESP_RST_BROWNOUT = power). Pairs with
+     * the 0xA2 NVS fix above so we can confirm the reboot is gone — and catch
+     * any residual cause. The dashboard already parses this boot line. */
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    ESP_LOGW(TAG, "Narbis fw v4.14.39 boot; reset_reason=%d", (int)reset_reason);
 
     /* v4.12.9: drop CPU to 80MHz for power savings.
      *
