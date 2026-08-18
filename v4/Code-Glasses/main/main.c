@@ -1661,11 +1661,23 @@
  *   brightness, kept firing on hall tap and made the device look healthy.
  *   STATIC never used brightness (it runs through lens_apply_static), so the
  *   assignments are removed; brightness is now owned solely by 0xA2. A
- *   persisted brightness of 0 is also self-healed at boot. */
+ *   persisted brightness of 0 is also self-healed at boot.
+ *
+ * v4.16.3 — write-without-response on the 0xFF01 control characteristic.
+ *   The control char was WRITE (with response) only, so every command took an
+ *   ATT round-trip; against the glasses' requested 20-30 ms interval + slave
+ *   latency 1 that capped real-time [0xA5,duty] streaming at ~8-20 writes/sec.
+ *   Adding BLE_GATT_CHR_F_WRITE_NO_RSP lets a client stream duty updates
+ *   without per-write acks — higher sustained lens-update rate for
+ *   neurofeedback screen-dimmer use. Purely additive: with-response writes
+ *   behave exactly as before, the dispatch path is shared, no attribute
+ *   handle changes, and slave latency / idle power are untouched (this is not
+ *   the latency-0 change — that would cost connected power and is not done
+ *   here). See the 0xFF01 entry in DASHBOARD_CHRS. */
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.16.2-FCC-TEST"
+#define FIRMWARE_VERSION "4.16.3-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.16.2-lensfix"
+#define FIRMWARE_VERSION "4.16.3-wnr"
 #endif
 static const char *TAG = "SG_v4.14.39";
 
@@ -5775,7 +5787,16 @@ static const struct ble_gatt_chr_def DASHBOARD_CHRS[] = {
     {
         .uuid       = &CHR_UUID_CTRL.u,
         .access_cb  = access_ctrl_cb,
-        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        /* v4.16.3: added WRITE_NO_RSP so real-time clients (neurofeedback
+         * dimmers) can stream [0xA5,duty] without an ATT round-trip per write,
+         * lifting the sustained lens-update rate above the ~8-20/sec that
+         * write-with-response allows. NimBLE delivers a write-without-response
+         * as the same BLE_GATT_ACCESS_OP_WRITE_CHR, so access_ctrl_cb /
+         * process_command handle both forms unchanged; with-response writes
+         * are unaffected. Same flag the OTA data char (0xFF02) already uses.
+         * Adding a property does not change the 0xFF01 attribute handle. */
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE |
+                      BLE_GATT_CHR_F_WRITE_NO_RSP,
         .val_handle = NULL,
     },
     {
