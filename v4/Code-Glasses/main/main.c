@@ -25,12 +25,23 @@
  * All pattern timing runs on-device via gptimer ISR (strobe) and led_task
  * 10ms tick loop (breathing). BLE app only sends configuration commands.
  *
- * Three on-device programs cycled by a short magnet tap (0.3-4s):
- *   1. BREATHE        — 6 BPM sine, lens tint follows waveform (default at boot)
- *   2. BREATHE+STROBE — 10Hz strobe whose dark-phase duty is modulated by the
- *                       breathing waveform (strobe "breathes")
- *   3. STROBE         — plain 10Hz strobe, no breathing
- * Long magnet close (>=5s) still enters deep sleep.
+ * STANDALONE PROGRAMS (v4.17.0 — was "three hard-coded programs"):
+ *   Out of the box the glasses run exactly ONE standalone program:
+ *   BREATHE at the saved pace (6 BPM unless an app overwrote it via 0xB1).
+ *   Opening the left arm powers on and starts it. Closing and re-opening
+ *   the arm inside 5 s does nothing at all. Holding the arm closed for
+ *   >=5 s still enters deep sleep, exactly as before.
+ *
+ *   The old programs 2 (BREATHE+STROBE) and 3 (STROBE) are no longer in
+ *   the default cycle. Nothing standalone strobes unless an app explicitly
+ *   programs a strobe slot.
+ *
+ *   Up to STANDALONE_MAX_PROGRAMS (5) slots can be programmed over BLE
+ *   (0xBD) and the arm-tap cycle enabled by setting the count >= 2 (0xBC).
+ *   With the cycle enabled the arm toggles through programs 1..N on a short
+ *   tap, exactly the way it used to toggle 1..3. Both the slot table and the
+ *   count live in NVS; an un-programmed device has count = 1 = cycle off.
+ *   See the "STANDALONE PROGRAM SLOTS" section for the full model.
  *
  * BLE ADVERTISING AUTO-OFF (v4.11.0, hardened in v4.11.1):
  *   To minimize idle current when the device is used standalone (hall-only,
@@ -99,6 +110,17 @@
  *   - BA [ms_lo][ms_hi][inh]  Breathe-sync (v4.15.5+): phase-lock the cosine
  *                         to the app's breath clock. u16 LE cycle ms + inhale
  *                         %; restarts the cycle at inhale start (now).
+ *
+ *   STANDALONE PROGRAMS (v4.17.0 — what the arm can reach with no app):
+ *   - BC [count]          How many programs the arm cycles. 0/1 = cycle OFF
+ *                         (the default: one program, arm tap does nothing),
+ *                         2-5 = arm short-tap toggles programs 1..count.
+ *   - BD [slot][mode][bpm][inh][dhz_lo][dhz_hi][duty][brt]
+ *                         Write standalone slot (0-based). mode 0=BREATHE,
+ *                         1=BREATHE+STROBE, 2=STROBE, 3=STATIC. Every
+ *                         numeric field: 0 = inherit the saved global.
+ *   - BE 00               Read back config → 0xFC frame on 0xFF03:
+ *                         [count][max][active][slot0..slot4 × 8 bytes].
  *
  *   OTA:
  *   - A8 00               Start OTA mode
@@ -1674,10 +1696,59 @@
  *   handle changes, and slave latency / idle power are untouched (this is not
  *   the latency-0 change — that would cost connected power and is not done
  *   here). See the 0xFF01 entry in DASHBOARD_CHRS. */
+/* CHANGELOG v4.17.0 — standalone simplification: one program, no strobe.
+ *
+ * WHAT CHANGED FOR A USER WITH NO APP
+ *   Before: opening the arm started BREATHE; a short close-and-reopen
+ *   (0.15-4 s) advanced through a hard-coded 3-program cycle
+ *   BREATHE -> BREATHE+STROBE -> STROBE, announced by 2 or 3 lens pulses.
+ *   Now: opening the arm starts BREATHE at the saved pace and that is the
+ *   whole standalone experience. Closing and re-opening the arm inside 5 s
+ *   does nothing — no program change, no pulse. Only holding the arm closed
+ *   for >=5 s sleeps, unchanged.
+ *
+ *   Rationale: the strobe programs were reachable by accident. Any user who
+ *   folded and re-opened an arm — putting the glasses down, adjusting fit —
+ *   landed in a 10 Hz strobe they never asked for and had no labelled way
+ *   back out of. The default product is a breathing guide; strobe is an
+ *   opt-in an app configures, not something a fold-and-unfold can trip.
+ *
+ * WHAT REPLACED THE HARD-CODED PROGRAM LIST
+ *   program_t (PROG_BREATHE / PROG_BREATHE_STROBE / PROG_STROBE, PROG_COUNT
+ *   == 3) is gone. In its place: a table of STANDALONE_MAX_PROGRAMS (5) NVS-
+ *   backed slots plus a count. Each slot is 8 bytes — mode, BPM, inhale %,
+ *   strobe deci-Hz, strobe duty, brightness, reserved — and every numeric
+ *   field supports 0 = "inherit the persisted global", so an all-zero slot
+ *   IS "BREATHE at the saved pace". A blank NVS therefore yields exactly the
+ *   new default with no migration step and no first-boot special-casing.
+ *
+ *   sa_count defaults to 1. At 1, the arm-tap program cycle is OFF: the tap
+ *   is still debounced and still counts toward the 5-tap forget-earclip
+ *   recovery gesture, but it changes nothing and shows nothing. Set it to
+ *   2..5 over BLE and the arm toggles programs 1..N on a short tap, the same
+ *   gesture that used to toggle 1..3, indicator pulses and all.
+ *
+ * NEW BLE SURFACE (all persisted, all cleared by the 0xBF factory reset)
+ *   0xBC [count]                       enable/disable the cycle. 0 or 1 = off
+ *                                      (single program), 2..5 = cycle N.
+ *   0xBD [slot][mode][bpm][inh]
+ *        [dhz_lo][dhz_hi][duty][brt]   write one slot, 0-indexed.
+ *   0xBE 00                            request readback -> 0xFC frame
+ *                                      [count][max][slot0..slot4 x 8].
+ *
+ * WHAT DID NOT CHANGE
+ *   PPG-auto programs (sensor plugged in, 0xB7) are a separate list and are
+ *   untouched. Every app-driven lens command — 0xA5 STATIC, 0xA6 STROBE,
+ *   0xB0 BREATHE/BREATHE+STROBE, 0xBA sync — behaves exactly as before; an
+ *   app can still put the lens in any mode at any time. This change is only
+ *   about what the *arm* can reach with no app in the picture. Sleep, wake,
+ *   battery, BLE re-arm on arm movement, and the 5-tap recovery gesture are
+ *   all unchanged. */
+
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.16.3-FCC-TEST"
+#define FIRMWARE_VERSION "4.17.0-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.16.3-wnr"
+#define FIRMWARE_VERSION "4.17.0"
 #endif
 static const char *TAG = "SG_v4.14.39";
 
@@ -1912,17 +1983,69 @@ typedef enum {
 } led_mode_t;
 
 /*******************************************************************************
- * PHYSICAL PROGRAMS (v4.10.0)
- * 
- * Hall-sensor-selectable programs cycled by short magnet tap.
- * Each program maps to a specific led_mode + parameter set.
+ * STANDALONE PROGRAM SLOTS (v4.17.0, replaces program_t from v4.10.0)
+ *
+ * A "standalone program" is what the glasses run with no app connected —
+ * selected by the left arm alone. v4.10.0 hard-coded three of them
+ * (BREATHE, BREATHE+STROBE, STROBE) and cycled them on a short arm tap.
+ * v4.17.0 replaces that with a programmable table:
+ *
+ *   sa_prog[0..STANDALONE_MAX_PROGRAMS-1]  the slot table (NVS blob)
+ *   sa_count                               how many slots the arm cycles
+ *
+ * DEFAULT (blank NVS, factory reset, or any unit that never talked to an
+ * app): sa_count = 1 and sa_prog[0] is all zeros. Slot mode 0 is BREATHE
+ * and every numeric field treats 0 as "inherit the persisted global", so an
+ * all-zero slot renders as BREATHE at the saved pace — 6 BPM unless an app
+ * overwrote KEY_BREATHE_BPM via 0xB1. That is the entire out-of-box
+ * standalone behavior: open the arm, breathe.
+ *
+ * With sa_count == 1 the arm-tap program cycle is OFF. A close-and-reopen
+ * inside the 5 s sleep threshold changes nothing and shows nothing. (The
+ * tap is still debounced and still feeds the 5-tap forget-earclip recovery
+ * gesture — that is a deliberate five-tap sequence, not something a stray
+ * fold trips.)
+ *
+ * With sa_count 2..5 the arm cycles slots 0..sa_count-1 on a short tap and
+ * announces the new one with the usual N-pulse indicator, exactly the way
+ * it cycled the three hard-coded programs. Slot 1 stays silent (see
+ * program_indicator).
+ *
+ * INHERIT-ON-ZERO, in detail. Every slot field except `mode` is 0 =
+ * inherit:
+ *   bpm        0 -> KEY_BREATHE_BPM     (default 6)
+ *   inhale_pct 0 -> KEY_BREATHE_INHALE  (default 40)
+ *   strobe_dhz 0 -> KEY_STROBE_DHZ      (default 100 = 10.0 Hz)
+ *   duty_pct   0 -> KEY_STROBE_DUTY     (default 50)
+ *   brightness 0 -> KEY_BRIGHTNESS      (default 100)
+ * Reading the baseline from NVS rather than caching it means a slot
+ * automatically tracks later 0xB1/0xB2/0xAB/0xAC/0xA2 writes, which persist.
+ * Program changes happen at arm-tap rates, so the NVS reads are free.
+ *
+ * Applying a slot writes the LIVE globals (breathe_bpm, strobe_dhz, ...)
+ * but never persists them, so cycling through slots does not rewrite the
+ * user's saved settings.
  ******************************************************************************/
+#define STANDALONE_MAX_PROGRAMS  5
+#define STANDALONE_SLOT_BYTES    8    /* wire + NVS size of one slot */
+
 typedef enum {
-    PROG_BREATHE         = 0,  /* Startup default */
-    PROG_BREATHE_STROBE  = 1,
-    PROG_STROBE          = 2,
-    PROG_COUNT           = 3,
-} program_t;
+    SA_MODE_BREATHE        = 0,  /* LED_MODE_BREATHE — the default */
+    SA_MODE_BREATHE_STROBE = 1,  /* LED_MODE_BREATHE_STROBE */
+    SA_MODE_STROBE         = 2,  /* LED_MODE_STROBE */
+    SA_MODE_STATIC         = 3,  /* LED_MODE_STATIC at the slot's brightness */
+    SA_MODE_COUNT          = 4,
+} sa_mode_t;
+
+typedef struct {
+    uint8_t  mode;        /* sa_mode_t */
+    uint8_t  bpm;         /* 1-30,  0 = inherit */
+    uint8_t  inhale_pct;  /* 10-90, 0 = inherit */
+    uint16_t strobe_dhz;  /* deci-Hz 10-500, 0 = inherit */
+    uint8_t  duty_pct;    /* 10-90, 0 = inherit */
+    uint8_t  brightness;  /* 1-100, 0 = inherit */
+    uint8_t  reserved;    /* keeps the record at STANDALONE_SLOT_BYTES */
+} standalone_prog_t;
 
 /*******************************************************************************
  * PPG-AUTO PROGRAMS (v4.14.0)
@@ -2066,8 +2189,18 @@ static volatile led_mode_t led_mode = LED_MODE_PULSE_ON_BEAT;
 static volatile led_mode_t led_mode = LED_MODE_BREATHE;
 #endif
 
-/* Current physical program (hall-selectable). Starts at PROG_BREATHE. */
-static volatile program_t current_program = PROG_BREATHE;
+/* v4.17.0: standalone program table + which slot the arm has selected.
+ *
+ * sa_prog       — the slot table. Zero-initialized, which IS the default
+ *                 program (BREATHE, everything inherited). prefs_load()
+ *                 overwrites it from NVS if an app has programmed slots.
+ * sa_count      — how many slots the arm cycles. 1 = cycle disabled (the
+ *                 default); 2..STANDALONE_MAX_PROGRAMS = cycle that many.
+ * current_program — 0-based index of the running slot. Not persisted, so
+ *                 every power-on lands on slot 0. */
+static standalone_prog_t sa_prog[STANDALONE_MAX_PROGRAMS];
+static volatile uint8_t  sa_count = 1;
+static volatile uint8_t  current_program = 0;
 
 /* PPG-auto mode state (v4.14.0).
  * ppg_auto_active       — true while we're in the PPG program cycle
@@ -2084,7 +2217,7 @@ static volatile program_t current_program = PROG_BREATHE;
  * coherence_task. */
 static volatile bool         ppg_auto_active      = false;
 static volatile ppg_program_t ppg_current_program = PPG_PROG_HEARTBEAT;
-static volatile program_t    saved_hall_program   = PROG_BREATHE;
+static volatile uint8_t      saved_hall_program   = 0;   /* v4.17.0: slot index */
 static uint8_t               ppg_present_streak_s = 0;
 static uint8_t               ppg_absent_streak_s  = 0;
 
@@ -2522,6 +2655,13 @@ static uint8_t adapt_resp_quintet(void) {
  * of re-scanning. 0xFF = not yet known. Cleared by 0xC7 0x01 (reprobe). */
 #define KEY_BATT_CH            "batt_ch"
 
+/* v4.17.0: standalone program table. KEY_SA_COUNT is how many slots the arm
+ * cycles (1 = cycle off, the default); KEY_SA_TABLE is the packed slot blob,
+ * STANDALONE_MAX_PROGRAMS × STANDALONE_SLOT_BYTES. Both absent on a blank
+ * NVS, which yields count 1 + an all-zero table = BREATHE at the saved pace. */
+#define KEY_SA_COUNT           "sa_cnt"
+#define KEY_SA_TABLE           "sa_tbl"
+
 /* Coherence-pipeline tuning (live-settable via 0xE0 COH_PARAMS).
  * One u8 per field for simplicity; matches the existing prefs_get_u8 path. */
 #define KEY_COH_MINIBIS        "coh_minibi"
@@ -2579,6 +2719,26 @@ static void prefs_set_u32(const char *key, uint32_t val) {
 /* Wipe the entire prefs namespace. Triggered by BLE command 0xBF.
  * After this call + reboot (or re-invocation of prefs_load), all
  * user preferences revert to compiled-in defaults. */
+/* v4.17.0: raw-blob accessors for the standalone slot table. Returns true
+ * on a full-length read; a short or missing blob leaves `out` untouched so
+ * the caller keeps its compiled-in defaults. */
+static bool prefs_get_blob(const char *key, void *out, size_t len) {
+    nvs_handle_t h;
+    if (nvs_open(PREFS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t got = len;
+    esp_err_t err = nvs_get_blob(h, key, out, &got);
+    nvs_close(h);
+    return (err == ESP_OK && got == len);
+}
+
+static void prefs_set_blob(const char *key, const void *val, size_t len) {
+    nvs_handle_t h;
+    if (nvs_open(PREFS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, key, val, len);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 static void prefs_reset_all(void) {
     nvs_handle_t h;
     if (nvs_open(PREFS_NS, NVS_READWRITE, &h) != ESP_OK) return;
@@ -2686,6 +2846,52 @@ static volatile uint8_t coh_pacer_current_bpm = 0;
  * static definitions). Call site is unchanged: prefs_load() is invoked
  * from app_main right after nvs_flash_init(), before any task starts.
  ******************************************************************************/
+/*******************************************************************************
+ * STANDALONE SLOT TABLE — pack / unpack / persist (v4.17.0)
+ *
+ * On the wire and in NVS a slot is STANDALONE_SLOT_BYTES bytes, little-endian:
+ *   [0] mode  [1] bpm  [2] inhale_pct  [3] dhz_lo  [4] dhz_hi
+ *   [5] duty_pct  [6] brightness  [7] reserved
+ * The struct is packed by hand rather than memcpy'd so the NVS layout does
+ * not depend on the compiler's padding of standalone_prog_t.
+ ******************************************************************************/
+static void sa_slot_pack(const standalone_prog_t *sp, uint8_t *out) {
+    out[0] = sp->mode;
+    out[1] = sp->bpm;
+    out[2] = sp->inhale_pct;
+    out[3] = (uint8_t)(sp->strobe_dhz & 0xFF);
+    out[4] = (uint8_t)(sp->strobe_dhz >> 8);
+    out[5] = sp->duty_pct;
+    out[6] = sp->brightness;
+    out[7] = sp->reserved;
+}
+
+static void sa_slot_unpack(const uint8_t *in, standalone_prog_t *sp) {
+    sp->mode       = (in[0] < SA_MODE_COUNT) ? in[0] : SA_MODE_BREATHE;
+    sp->bpm        = in[1];
+    sp->inhale_pct = in[2];
+    sp->strobe_dhz = (uint16_t)in[3] | ((uint16_t)in[4] << 8);
+    sp->duty_pct   = in[5];
+    sp->brightness = in[6];
+    sp->reserved   = 0;
+}
+
+static void sa_table_save(void) {
+    uint8_t blob[STANDALONE_MAX_PROGRAMS * STANDALONE_SLOT_BYTES];
+    for (int i = 0; i < STANDALONE_MAX_PROGRAMS; i++) {
+        sa_slot_pack(&sa_prog[i], blob + i * STANDALONE_SLOT_BYTES);
+    }
+    prefs_set_blob(KEY_SA_TABLE, blob, sizeof(blob));
+}
+
+static void sa_table_load(void) {
+    uint8_t blob[STANDALONE_MAX_PROGRAMS * STANDALONE_SLOT_BYTES];
+    if (!prefs_get_blob(KEY_SA_TABLE, blob, sizeof(blob))) return;  /* keep zeros */
+    for (int i = 0; i < STANDALONE_MAX_PROGRAMS; i++) {
+        sa_slot_unpack(blob + i * STANDALONE_SLOT_BYTES, &sa_prog[i]);
+    }
+}
+
 static void prefs_load(void) {
     brightness          = prefs_get_u8 (KEY_BRIGHTNESS,       DEFAULT_BRIGHTNESS);
     /* v4.16.2: self-heal a persisted brightness of 0.
@@ -2725,6 +2931,15 @@ static void prefs_load(void) {
     lens_slew_cfg       = prefs_get_u8 (KEY_SLEW_MAX,         0);
     dc_behavior         = prefs_get_u8 (KEY_DC_BEHAV,         0);
 
+    /* v4.17.0: standalone program table. Default count 1 = arm-tap cycle
+     * off; default table is the zeros sa_prog[] already holds, which render
+     * as BREATHE-at-saved-pace. Clamp defensively so a corrupt count can
+     * never let the arm index past the table. */
+    sa_count = prefs_get_u8(KEY_SA_COUNT, 1);
+    if (sa_count < 1) sa_count = 1;
+    if (sa_count > STANDALONE_MAX_PROGRAMS) sa_count = STANDALONE_MAX_PROGRAMS;
+    sa_table_load();
+
     /* Coherence-pipeline tuning — loaded into g_coh_params. Defaults
      * mirror NARBIS_COH_PARAMS_DEFAULTS_INIT so a fresh NVS or a missing
      * key both land on the same algorithm shape that's compiled in. */
@@ -2741,6 +2956,9 @@ static void prefs_load(void) {
     g_coh_params.peak_halfwidth = prefs_get_u8(KEY_COH_PK_HW,   0);
     g_coh_params.coh_multiplier = prefs_get_u8(KEY_COH_MULT,    100);
 
+    ESP_LOGI(TAG, "prefs: standalone programs=%d (%s), slot0 mode=%d",
+             sa_count, sa_count > 1 ? "arm cycles" : "arm cycle OFF",
+             sa_prog[0].mode);
     ESP_LOGI(TAG, "prefs: brt=%d sess=%lumin strb=%dHz/%d%% brth=%dBPM/%d%% coh_diff=%d adapt=%d",
              brightness, (unsigned long)(session_duration_ms/60000),
              strobe_dhz/10, strobe_duty_pct,
@@ -3156,34 +3374,77 @@ static void strobe_update(void) {
  * Sets led_mode + strobe state for a given program. Called from hall-gesture
  * handler. Safe to call even before session_active — strobe_start() is gated.
  ******************************************************************************/
-static void apply_program(program_t p) {
-    current_program = p;
-    switch (p) {
-        case PROG_BREATHE:
+/* v4.17.0: resolve one slot field. 0 means "inherit the persisted global",
+ * which is what makes an all-zero slot render as the saved default program.
+ * Reading NVS here (rather than caching at boot) means the slot tracks any
+ * later 0xB1/0xB2/0xAB/0xAC/0xA2 write, all of which persist. Called only on
+ * a program change — arm-tap rates, so the read cost is irrelevant. */
+static uint8_t sa_field(uint8_t slot_val, const char *key, uint8_t dflt) {
+    return slot_val ? slot_val : prefs_get_u8(key, dflt);
+}
+
+/*******************************************************************************
+ * APPLY A STANDALONE PROGRAM SLOT (v4.17.0, was apply_program(program_t))
+ *
+ * Takes a 0-based slot index. Out-of-range collapses to slot 0 so no caller
+ * can drive the lens off the end of the table.
+ *
+ * Writes the LIVE parameter globals from the slot but never persists them —
+ * cycling through slots must not rewrite the user's saved settings. Slots
+ * that inherit (field == 0) restore the persisted value, so cycling away
+ * from an override and back is lossless.
+ ******************************************************************************/
+static void apply_program(uint8_t slot) {
+    if (slot >= STANDALONE_MAX_PROGRAMS) slot = 0;
+    current_program = slot;
+
+    const standalone_prog_t *sp = &sa_prog[slot];
+
+    /* Resolve every parameter up front — each mode below uses a subset, but
+     * a slot that inherits must restore the persisted value in all of them,
+     * otherwise a leftover override from the previous slot would leak in. */
+    breathe_bpm        = sa_field(sp->bpm,        KEY_BREATHE_BPM,    6);
+    breathe_inhale_pct = sa_field(sp->inhale_pct, KEY_BREATHE_INHALE, 40);
+    strobe_duty_pct    = sa_field(sp->duty_pct,   KEY_STROBE_DUTY,    50);
+    brightness         = sa_field(sp->brightness, KEY_BRIGHTNESS,     DEFAULT_BRIGHTNESS);
+    strobe_dhz         = sp->strobe_dhz
+                       ? sp->strobe_dhz
+                       : (uint16_t)prefs_get_u8(KEY_STROBE_DHZ, DEFAULT_STROBE_DHZ / 10) * 10;
+    strobe_update();   /* recache the DDS dark threshold for the new duty */
+
+    switch (sp->mode) {
+        case SA_MODE_BREATHE:
+        default:
             strobe_stop();
             led_mode = LED_MODE_BREATHE;
             /* Clear any residual strobe duty immediately; led_task will
              * overwrite effective_duty on next 10ms tick with the waveform. */
             effective_duty = 0;
-            ESP_LOGI(TAG, "Program 1: BREATHE %d BPM %s",
-                     breathe_bpm, breathe_wave == 0 ? "sine" : "linear");
+            ESP_LOGI(TAG, "Program %d: BREATHE %d BPM %s @ %d%%",
+                     slot + 1, breathe_bpm,
+                     breathe_wave == 0 ? "sine" : "linear", brightness);
             break;
 
-        case PROG_BREATHE_STROBE:
+        case SA_MODE_BREATHE_STROBE:
             led_mode = LED_MODE_BREATHE_STROBE;
             if (session_active) strobe_start();
-            ESP_LOGI(TAG, "Program 2: BREATHE+STROBE %d BPM + %d.%dHz %d%% duty",
-                     breathe_bpm, strobe_dhz / 10, strobe_dhz % 10, strobe_duty_pct);
+            ESP_LOGI(TAG, "Program %d: BREATHE+STROBE %d BPM + %d.%dHz %d%% duty",
+                     slot + 1, breathe_bpm, strobe_dhz / 10, strobe_dhz % 10,
+                     strobe_duty_pct);
             break;
 
-        case PROG_STROBE:
+        case SA_MODE_STROBE:
             led_mode = LED_MODE_STROBE;
             if (session_active) strobe_start();
-            ESP_LOGI(TAG, "Program 3: STROBE %d.%dHz %d%% duty",
-                     strobe_dhz / 10, strobe_dhz % 10, strobe_duty_pct);
+            ESP_LOGI(TAG, "Program %d: STROBE %d.%dHz %d%% duty",
+                     slot + 1, strobe_dhz / 10, strobe_dhz % 10, strobe_duty_pct);
             break;
 
-        default:
+        case SA_MODE_STATIC:
+            strobe_stop();
+            led_mode = LED_MODE_STATIC;
+            lens_apply_static(brightness);   /* honors the smoothing/slew knobs */
+            ESP_LOGI(TAG, "Program %d: STATIC @ %d%%", slot + 1, brightness);
             break;
     }
 }
@@ -3535,6 +3796,11 @@ static void send_status_frame(uint8_t type, const uint8_t *payload, size_t len) 
  * divider ground leg). None of this applies to it; its battery arrives
  * pre-computed over the relay as 0xF8.
  ******************************************************************************/
+/* v4.17.0: standalone-program config readback frame (reply to 0xBE).
+ * Declared here alongside BATT_FRAME_TYPE so the 0xFF03 frame-type
+ * allocation stays visible in one place. */
+#define SA_CONFIG_FRAME_TYPE    0xFC
+
 #define BATT_FRAME_TYPE         0xFB
 #define BATT_DIVIDER_NUM        2u          /* VBAT = pin_mv × 2 (both legs 1 MΩ) */
 #define BATT_SAMPLE_PERIOD_MS   10000
@@ -4462,15 +4728,38 @@ static void enter_deep_sleep(void) {
 }
 
 /*******************************************************************************
- * HALL SENSOR — GESTURE STATE MACHINE (v4.10.0)
+ * HALL SENSOR — GESTURE STATE MACHINE (v4.10.0, reshaped v4.17.0)
  *
- * Polled at HALL_POLL_MS (50ms) from a dedicated task. Two gestures:
- *   - Short close (HALL_SHORT_MIN_MS .. HALL_SHORT_MAX_MS, decided on release)
- *       → advance to next physical program
- *   - Long close (>= HALL_LONG_MS continuous HIGH, decided while still held)
- *       → enter deep sleep
- * 4000-5000ms release window is intentional dead zone (no action) so the
- * user has a clear gap between "quick tap" and "hold to sleep".
+ * Polled at HALL_POLL_MS (50ms) from a dedicated task.
+ *
+ * THE ONLY GESTURE THAT DOES ANYTHING BY DEFAULT (v4.17.0):
+ *   - Long close (>= HALL_LONG_MS = 5s continuous HIGH, decided while still
+ *     held) → deep sleep. Unchanged.
+ *
+ * Everything shorter than 5 s is now a no-op out of the box. Closing the arm
+ * and re-opening it inside 5 s changes nothing and shows nothing: no program
+ * advance, no indicator pulse. Before v4.17.0 a 0.15-4 s close advanced a
+ * hard-coded three-program cycle, which meant folding an arm and opening it
+ * again could silently drop the user into a 10 Hz strobe. See the v4.17.0
+ * CHANGELOG.
+ *
+ * WHEN THE APP HAS ENABLED THE CYCLE (sa_count >= 2):
+ *   - Short close (HALL_SHORT_MIN_MS .. HALL_SHORT_MAX_MS, decided on
+ *     release) → advance to the next standalone slot, wrapping at sa_count,
+ *     with the usual N-pulse indicator. Identical gesture and feel to the
+ *     old 1→2→3 cycle, just over a programmable 1..5 table.
+ *   - 4000-5000ms release stays an intentional dead zone (no action) so the
+ *     user has a clear gap between "quick tap" and "hold to sleep".
+ *
+ * ALWAYS ACTIVE, regardless of sa_count:
+ *   - Short taps are still detected and timestamped, because five of them
+ *     inside 2 s is the forget-earclip recovery gesture. That is a
+ *     deliberate five-tap sequence — not something a stray fold trips — so
+ *     it stays reachable on a device with the program cycle disabled.
+ *   - Any arm movement re-arms BLE advertising (leading edge). Invisible to
+ *     the user and required for pairing after the radio auto-off, so it is
+ *     not part of "closing and reopening does nothing".
+ *
  * 50ms debounce on both edges.
  *
  * The Hall pin reads HIGH when the magnet is near (arm closed), LOW when far.
@@ -4506,16 +4795,20 @@ static void hall_task(void *param) {
     bool sleep_fired = false;       /* Prevent double-firing the 5s threshold */
 
     /* Path B: 5 short taps within a 2-second sliding window forget the
-     * paired earclip and trigger a fresh BLE-central rescan. The taps
-     * also advance 5 programs (existing short-tap behavior) — accepted
-     * side effect; this gesture is the no-app-handy recovery path. */
+     * paired earclip and trigger a fresh BLE-central rescan. v4.17.0: with
+     * the program cycle off (the default) the five taps have no other
+     * effect at all; with it on they also advance 5 programs, which wraps
+     * back to where the user started for a 5-slot setup — accepted side
+     * effect, this gesture is the no-app-handy recovery path. */
     uint8_t  tap_count = 0;
     uint32_t last_tap_tick = 0;
     const uint32_t TAP_WINDOW_MS = 2000;
     const uint8_t  TAP_FORGET_COUNT = 5;
 
-    ESP_LOGI(TAG, "Hall gesture task started (poll=%dms short=%d-%dms long=%dms)",
-             HALL_POLL_MS, HALL_SHORT_MIN_MS, HALL_SHORT_MAX_MS, HALL_LONG_MS);
+    ESP_LOGI(TAG, "Hall gesture task started (poll=%dms short=%d-%dms long=%dms), "
+                  "standalone programs=%d → short tap %s",
+             HALL_POLL_MS, HALL_SHORT_MIN_MS, HALL_SHORT_MAX_MS, HALL_LONG_MS,
+             sa_count, sa_count > 1 ? "cycles programs" : "does nothing");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(HALL_POLL_MS));
@@ -4597,18 +4890,34 @@ static void hall_task(void *param) {
                     ppg_apply_program(next);
                     /* v4.14.2: indicator shows new program (1-based count) */
                     indicator_trigger((uint8_t)(next + 1), 0);
-                } else {
-                    program_t next = (program_t)((current_program + 1) % PROG_COUNT);
-                    ESP_LOGI(TAG, "Hall short-tap %lums → advance to program %d",
-                             held_ms, next);
+                } else if (sa_count > 1) {
+                    /* v4.17.0: the arm only cycles standalone programs when
+                     * an app has actually programmed more than one. Wrapping
+                     * at sa_count (not the table size) means a 2-program
+                     * setup toggles 1↔2 and never lands on an unwritten
+                     * slot. */
+                    uint8_t next = (uint8_t)((current_program + 1) % sa_count);
+                    ESP_LOGI(TAG, "Hall short-tap %lums → advance to standalone program %d/%d",
+                             held_ms, next + 1, sa_count);
                     apply_program(next);
                     /* v4.14.2: indicator shows new program (1-based count).
                      * v4.16.1: program 1 is silent — cycling back around to
                      * it drops straight into the breathe program. See
                      * program_indicator(). */
                     program_indicator((uint8_t)(next + 1));
+                } else {
+                    /* v4.17.0 DEFAULT PATH. One standalone program is
+                     * configured, so a close-and-reopen inside the 5 s sleep
+                     * threshold does nothing the user can see. The tap is
+                     * still counted below for the 5-tap recovery gesture. */
+                    ESP_LOGI(TAG, "Hall short-tap %lums → ignored (single standalone program)",
+                             held_ms);
                 }
-                /* v4.14.34: refresh BLE advertising window on user interaction. */
+                /* v4.14.34: refresh BLE advertising window on user interaction.
+                 * v4.17.0: still fires on an ignored tap. Re-arming the radio
+                 * is invisible and is how a user gets the glasses advertising
+                 * again after the idle auto-off, so it is deliberately not
+                 * gated on the program cycle being enabled. */
                 if (ble_stack_up && !is_connected) {
                     ble_adv_reset_deadline();
                 }
@@ -5437,6 +5746,114 @@ static void process_command(uint8_t *data, uint16_t len) {
                 ESP_LOGI(TAG, "BLE: breathe sync cycle=%lums inhale=%u%%",
                          (unsigned long)cms, inh);
                 ble_log("breathe sync %lums", (unsigned long)cms);
+            }
+            break;
+
+        /* ── STANDALONE PROGRAMS (v4.17.0) ─────────────────── */
+        case 0xBC:  /* Set how many standalone programs the arm cycles.
+                     *   arg 0 or 1 → cycle OFF (single program). Default.
+                     *   arg 2..STANDALONE_MAX_PROGRAMS → arm short-tap
+                     *      toggles programs 1..arg, the same gesture that
+                     *      used to toggle the hard-coded 1..3.
+                     * Persisted. Out-of-range values are clamped rather than
+                     * ignored so an app can send STANDALONE_MAX_PROGRAMS
+                     * without first querying the firmware's limit.
+                     *
+                     * Shrinking the count below the running slot index would
+                     * leave the lens on a program the arm can no longer reach,
+                     * so fall back to slot 0. Only while standalone: in
+                     * ppg-auto the lens is running a PPG program and must not
+                     * be yanked out of it by a settings write — just move the
+                     * remembered standalone index back into range. */
+            if (arg < 1) arg = 1;
+            if (arg > STANDALONE_MAX_PROGRAMS) arg = STANDALONE_MAX_PROGRAMS;
+            sa_count = (uint8_t)arg;
+            prefs_set_u8(KEY_SA_COUNT, sa_count);
+            if (current_program >= sa_count) {
+                if (ppg_auto_active) {
+                    current_program    = 0;
+                    saved_hall_program = 0;
+                } else {
+                    apply_program(0);
+                }
+            }
+            ESP_LOGI(TAG, "BLE: standalone program count = %d (%s, saved)",
+                     sa_count, sa_count > 1 ? "arm cycles" : "arm cycle OFF");
+            ble_log("standalone count = %d", sa_count);
+            break;
+
+        case 0xBD:  /* Write one standalone program slot.
+                     *   [0xBD][slot][mode][bpm][inhale][dhz_lo][dhz_hi][duty][brightness]
+                     *   len == 9
+                     *
+                     * slot       0-based, < STANDALONE_MAX_PROGRAMS
+                     * mode       0 BREATHE / 1 BREATHE+STROBE / 2 STROBE / 3 STATIC
+                     * bpm        1-30,   0 = inherit the saved 0xB1 value
+                     * inhale     10-90,  0 = inherit the saved 0xB2 value
+                     * dhz        u16 LE deci-Hz 10-500, 0 = inherit 0xAB
+                     * duty       10-90,  0 = inherit the saved 0xAC value
+                     * brightness 1-100,  0 = inherit the saved 0xA2 value
+                     *
+                     * Persisted immediately. Writing the slot the device is
+                     * currently running re-applies it so the app sees the
+                     * change on the lens without a program change. Note this
+                     * does NOT enable the arm cycle — that is 0xBC. */
+            if (len >= 9 && data[1] < STANDALONE_MAX_PROGRAMS) {
+                uint8_t slot = data[1];
+                standalone_prog_t sp;
+                sa_slot_unpack(&data[2], &sp);
+
+                /* Clamp each field to its documented range, preserving 0 =
+                 * inherit. A clamp rather than a reject: the app should not
+                 * be able to brick a standalone program with a typo, and a
+                 * silently-dropped write is harder to diagnose than a
+                 * clamped one (the 0xBE readback shows what stuck). */
+                if (sp.bpm        && sp.bpm        > 30)  sp.bpm        = 30;
+                if (sp.inhale_pct && sp.inhale_pct < 10)  sp.inhale_pct = 10;
+                if (sp.inhale_pct && sp.inhale_pct > 90)  sp.inhale_pct = 90;
+                if (sp.strobe_dhz && sp.strobe_dhz < MIN_STROBE_HZ * 10)
+                    sp.strobe_dhz = MIN_STROBE_HZ * 10;
+                if (sp.strobe_dhz && sp.strobe_dhz > MAX_STROBE_HZ * 10)
+                    sp.strobe_dhz = MAX_STROBE_HZ * 10;
+                if (sp.duty_pct   && sp.duty_pct   < 10)  sp.duty_pct   = 10;
+                if (sp.duty_pct   && sp.duty_pct   > 90)  sp.duty_pct   = 90;
+                if (sp.brightness && sp.brightness > 100) sp.brightness = 100;
+
+                sa_prog[slot] = sp;
+                sa_table_save();
+                ESP_LOGI(TAG, "BLE: standalone slot %d = mode %d bpm %d inh %d "
+                              "%d.%dHz duty %d brt %d (saved)",
+                         slot + 1, sp.mode, sp.bpm, sp.inhale_pct,
+                         sp.strobe_dhz / 10, sp.strobe_dhz % 10,
+                         sp.duty_pct, sp.brightness);
+                ble_log("sa slot %d mode %d", slot + 1, sp.mode);
+                if (current_program == slot && !ppg_auto_active) {
+                    apply_program(slot);
+                }
+            } else {
+                ESP_LOGW(TAG, "BLE: 0xBD malformed (len %d, slot %d)",
+                         len, len >= 2 ? data[1] : -1);
+                ble_log("0xBD malformed");
+            }
+            break;
+
+        case 0xBE:  /* Read back the whole standalone configuration.
+                     * Replies with a 0xFC status frame on 0xFF03:
+                     *   [0xFC][count][max][active][slot0..slot4 × 8 bytes]
+                     * = 4 + 40 = 44 bytes, well under the MTU cap. `active`
+                     * is the 0-based index of the running slot so the app can
+                     * highlight it without a second query. */
+            {
+                uint8_t pl[3 + STANDALONE_MAX_PROGRAMS * STANDALONE_SLOT_BYTES];
+                pl[0] = sa_count;
+                pl[1] = STANDALONE_MAX_PROGRAMS;
+                pl[2] = current_program;
+                for (int i = 0; i < STANDALONE_MAX_PROGRAMS; i++) {
+                    sa_slot_pack(&sa_prog[i], &pl[3 + i * STANDALONE_SLOT_BYTES]);
+                }
+                send_status_frame(SA_CONFIG_FRAME_TYPE, pl, sizeof(pl));
+                ESP_LOGI(TAG, "BLE: standalone config dump (count %d, active %d)",
+                         sa_count, current_program);
             }
             break;
 
@@ -7657,6 +8074,23 @@ void app_main(void) {
     /* Start hardware drive timer (100µs gptimer ISR — AC + strobe) */
     drive_timer_init();
 
+#if !PPG_TEST_BUILD
+    /* v4.17.0: land on standalone slot 0 at power-on. On an un-programmed
+     * device this is a no-op in effect — the slot is all zeros, so it
+     * resolves to BREATHE at the saved pace, which is what led_mode was
+     * statically initialized to anyway. It matters once an app has written
+     * slot 0: without this call the boot program would ignore whatever the
+     * user configured until they tapped the arm.
+     *
+     * Runs BEFORE led_task is created, so session_active is still false and
+     * apply_program() skips strobe_start(). led_task's own boot conditional
+     * starts the strobe if slot 0 selected a strobing mode.
+     *
+     * Skipped in PPG_TEST_BUILD, which deliberately boots into
+     * PULSE_ON_BEAT and has no hall task to change programs. */
+    apply_program(0);
+#endif
+
     /* v4.12.0: initialize ADC1 for PulseSensor.
      * Width 12-bit = 0–4095 codes. Attenuation 11dB gives ~0–3.1V
      * full-scale, which cleanly maps the PulseSensor's ~1.65V
@@ -7684,7 +8118,8 @@ void app_main(void) {
      * boot program indefinitely until the session timer expires or BLE
      * A7 00 (sleep) is sent. */
 #else
-    /* Create Hall gesture task (50ms polling, short-tap = next program, 5s hold = sleep) */
+    /* Create Hall gesture task (50ms polling, 5s hold = sleep; v4.17.0: short
+     * tap cycles standalone programs only when an app enabled the cycle) */
     xTaskCreate(hall_task, "hall_task", 2048, NULL, 2, NULL);
 #endif
 
