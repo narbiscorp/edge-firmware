@@ -287,9 +287,9 @@ extension StandaloneProgram {
 }
 
 func writeSlot(_ index: UInt8, _ program: StandaloneProgram) {
-    var packet: [UInt8] = [0xBD, index]
-    packet += program.wireBytes
-    packet.append(0)                       // reserved
+    // 9 B total: [0xBD][slot] + 7 payload bytes. The write form has NO
+    // reserved byte — see the warning below.
+    let packet: [UInt8] = [0xBD, index] + program.wireBytes
     precondition(packet.count == 9)
     peripheral.writeValue(Data(packet), for: controlChar, type: .withResponse)
 }
@@ -303,9 +303,16 @@ func requestStandaloneConfig() {
 }
 ```
 
-Note the trailing `0` in `writeSlot` — `wireBytes` is 7 bytes, the reserved byte
-makes 9. Keep the `precondition`; a short write is silently ignored by the
-firmware and is otherwise painless to ship and painful to debug.
+> ⚠️ **The read and write slot layouts differ by one byte.** A `0xFC` **record
+> is 8 bytes** — it carries a trailing reserved byte. The `0xBD` **write payload
+> is 7 bytes**, giving 9 on the wire once you prepend the opcode and slot index,
+> and has **no** reserved byte. Do not echo a decoded record straight back into
+> a write — that produces a 10-byte frame. (The firmware happens to tolerate it:
+> it checks `len >= 9` and reads only the first 7 payload bytes. Don't rely
+> on it.)
+
+Keep the `precondition`; a malformed write is silently dropped by the firmware,
+which is painless to ship and painful to debug.
 
 ### 4.3 Decoding the `0xFC` frame
 
