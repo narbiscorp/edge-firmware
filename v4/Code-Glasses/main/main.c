@@ -1675,7 +1675,7 @@
  *   the latency-0 change — that would cost connected power and is not done
  *   here). See the 0xFF01 entry in DASHBOARD_CHRS. */
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.16.3-FCC-TEST"
+#define FIRMWARE_VERSION "4.16.4-FCC-TEST"
 #else
 #define FIRMWARE_VERSION "4.16.3-wnr"
 #endif
@@ -1752,7 +1752,17 @@ static const char *TAG = "SG_v4.14.39";
  * BT controller), so leaving it up for 5 min is pure waste when nobody
  * connects. Any hall event (tap or hold edge) re-arms BLE and resets the
  * window, so the device is still easy to reconnect after teardown. */
+#if FCC_TEST_BUILD
+/* v4.16.4 (FCC): 10 minutes, not 2. In a radiated chamber nothing ever
+ * connects, so the production 120 s window expires mid-run and the DUT goes
+ * silent — which reads at the analyzer as "the advertising stopped" and cost
+ * the lab several attempts. 10 min covers a full sweep set. Battery is
+ * irrelevant on a bench-powered EUT, and the continuous-advertising mode
+ * (0xD3) disables the deadline outright for the length of its run. */
+#define BLE_IDLE_TIMEOUT_MS     600000
+#else
 #define BLE_IDLE_TIMEOUT_MS     120000
+#endif
 
 /*******************************************************************************
  * HARDWARE CONFIGURATION
@@ -2798,6 +2808,52 @@ static TaskHandle_t     fcc_task_handle = NULL;
 /* ESP_PWR_LVL_N12(0) → -12 dBm ... ESP_PWR_LVL_P9(7) → +9 dBm, 3 dB apart. */
 static inline int fcc_dbm_of(uint8_t lvl) { return -12 + 3 * (int)lvl; }
 static inline uint32_t fcc_mhz_of(uint8_t ch) { return 2402u + 2u * (uint32_t)ch; }
+
+/* ── CONTINUOUS ADVERTISING (v4.16.4, FCC build only) ──────────────────────
+ * Sporton could not capture the advertising duty cycle in the radiated
+ * chamber. Three production behaviours work against them, and this mode
+ * removes all three for the length of a run:
+ *
+ *   1. advertising round-robins ch37/38/39, so only every third event lands
+ *      on the frequency under test (start_advertising leaves channel_map 0,
+ *      which NimBLE reads as "all three");
+ *   2. the interval is randomised across ADV_INT_MIN..ADV_INT_MAX
+ *      (100-200 ms), so there is no stable repetition rate to trigger on;
+ *   3. BLE_IDLE_TIMEOUT_MS tears the stack down when nothing connects.
+ *
+ * The adv PAYLOAD is deliberately NOT touched — the on-air burst stays the
+ * declared 32 B / 256 us ADV_IND. Only channel, interval and duration change.
+ *
+ * Default is ADV_NONCONN_IND, for two reasons: nothing in the chamber can
+ * connect and silence the DUT mid-sweep, and no SCAN_REQ can draw a SCAN_RSP
+ * that would add un-modelled airtime to the measurement. ADV_NONCONN_IND and
+ * ADV_IND have identical PDU layout (only the 4-bit type differs), so the
+ * measured burst length is unchanged. Set fcc_adv_conn for ADV_IND if the lab
+ * wants the connectable case instead.
+ *
+ * advDelay (0-10 ms pseudo-random, added by the controller on every event)
+ * is spec-mandated and cannot be removed here. Spacing reads 100-110 ms. */
+#define FCC_ADV_DEFAULT_MINUTES 20
+#define FCC_ADV_ITVL_DEFAULT    0x0A0   /* 160 × 0.625 ms = 100 ms = ADV_INT_MIN */
+#define FCC_ADV_ITVL_MIN        0x020   /* 20 ms — NimBLE ble_gap_adv_validate floor */
+#define FCC_ADV_ITVL_MAX        0x4000  /* 10.24 s — same validator's ceiling */
+
+static volatile bool     fcc_adv_active    = false;
+static volatile bool     fcc_adv_start_req = false;
+static volatile uint8_t  fcc_adv_chanmap   = 0x01;  /* bit0=ch37 bit1=ch38 bit2=ch39 */
+static volatile uint16_t fcc_adv_itvl      = FCC_ADV_ITVL_DEFAULT;
+static volatile uint8_t  fcc_adv_minutes   = FCC_ADV_DEFAULT_MINUTES;
+static volatile bool     fcc_adv_conn      = false; /* false = ADV_NONCONN_IND */
+
+/* Lowest primary channel the map selects — what the operator points the
+ * analyzer at. Only meaningful when a single bit is set. */
+static inline uint32_t fcc_adv_mhz_of(uint8_t map) {
+    return (map & 0x01) ? 2402u : (map & 0x02) ? 2426u : 2480u;
+}
+/* itvl is in 0.625 ms units; ×5/8 converts to whole ms without floating point. */
+static inline uint32_t fcc_adv_ms_of(uint16_t itvl) {
+    return ((uint32_t)itvl * 5u) / 8u;
+}
 #endif /* FCC_TEST_BUILD */
 
 static void lens_apply_static(uint8_t duty) {
@@ -2926,6 +2982,11 @@ static void ble_adv_rearm(void);
 static void ble_adv_reset_deadline(void);
 static esp_err_t ble_stack_init(void);
 static esp_err_t ble_stack_teardown(void);
+#if FCC_TEST_BUILD
+/* v4.16.4: fcc_adv_run() sits above the NimBLE module block but has to
+ * restart advertising to make new GAP params take effect. */
+static void start_advertising(void);
+#endif
 /* NimBLE single GAP event handler (replaces Bluedroid's split gap/gatts
  * handlers and the narbis_central_gap_event forwarder; central registers
  * its own per-call cb with NimBLE). */
@@ -4536,9 +4597,10 @@ static void hall_task(void *param) {
          * running during DTM (only the BLE stack is torn down). Claim the
          * gesture here and skip the normal program-cycle / sleep handling —
          * fcc_task sees the flag, ends the test, and restores BLE. */
-        if (fcc_dtm_active) {
+        if (fcc_dtm_active || fcc_adv_active) {
             if (level == 1 && prev_level == 0) {
-                ESP_LOGW(TAG, "FCC: magnet tap → ending DTM early");
+                ESP_LOGW(TAG, "FCC: magnet tap → ending %s early",
+                         fcc_dtm_active ? "DTM" : "continuous advertising");
                 fcc_stop_req = true;
             }
             prev_level = level;
@@ -4942,6 +5004,103 @@ restore:
     ESP_LOGW(TAG, "FCC: BLE restored — reconnect to reconfigure");
 }
 
+/* Continuous single-channel advertising. Runs ONLY in fcc_task context.
+ *
+ * Unlike DTM this does NOT tear the stack down — advertising IS the thing
+ * being measured, so the host stays up the whole time. All that changes is
+ * the GAP params, which NimBLE only latches at ble_gap_adv_start(), hence
+ * the stop/start pair below. */
+static void fcc_adv_run(void) {
+    uint8_t  map  = fcc_adv_chanmap;
+    uint16_t itvl = fcc_adv_itvl;
+    uint8_t  min  = fcc_adv_minutes ? fcc_adv_minutes : FCC_ADV_DEFAULT_MINUTES;
+    uint32_t saved_session_ms;
+
+    ESP_LOGW(TAG, "FCC: continuous adv map 0x%02X (%lu MHz) itvl %lu ms for %u min, %s",
+             (unsigned)map, (unsigned long)fcc_adv_mhz_of(map),
+             (unsigned long)fcc_adv_ms_of(itvl), (unsigned)min,
+             fcc_adv_conn ? "ADV_IND" : "ADV_NONCONN_IND");
+
+    /* Same session bookkeeping as fcc_dtm_run, and load-bearing for the same
+     * reasons: drive_timer_cb force-zeros effective_duty every 100 us while
+     * !session_active, and led_task clears session_active on expiry — either
+     * would kill the lens pulse partway through a long run. Restored on exit;
+     * runtime-only, NVS untouched. */
+    strobe_stop();
+    led_mode = LED_MODE_STATIC;
+    lens_glide_active = false;
+    lens_fine_raw     = -1;
+    saved_session_ms   = session_duration_ms;
+    session_duration_ms = ((uint32_t)min + 2u) * 60000u;
+    session_start_tick  = xTaskGetTickCount();
+    session_active      = true;
+
+    /* Let the "starting" 0xF1 frame reach the app before we drop the link. */
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    fcc_adv_active = true;   /* start_advertising() reads this; must precede it */
+
+    /* A live connection suppresses advertising entirely, and the operator's
+     * own controller session is exactly such a connection. Drop it — 0x13 is
+     * "remote user terminated", which the app reports as a clean disconnect
+     * rather than a fault. The DISCONNECT handler calls start_advertising()
+     * for us, which is where the override lands. */
+    if (is_connected && g_conn_handle != 0xFFFF) {
+        ble_gap_terminate(g_conn_handle, 0x13);
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    /* Not connected (or the terminate raced): force the param change through
+     * a stop/start. EALREADY from either call is benign — it just means we
+     * were already in the state we wanted. */
+    if (!is_connected) {
+        int rc = ble_gap_adv_stop();
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "FCC: adv_stop rc=%d", rc);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        start_advertising();
+    }
+
+    {   /* Hold for the duration or until a magnet tap, pulsing the lens
+         * 1 s on / 1 s off exactly as DTM does — with no link to query, it is
+         * the operator's only sign the mode is live. Fixed-period edges so
+         * the square wave doesn't drift with the 20 ms poll. */
+        TickType_t deadline  = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)min * 60000u);
+        TickType_t next_edge = xTaskGetTickCount();
+        bool lens_on = false;
+        while (!fcc_stop_req && xTaskGetTickCount() < deadline) {
+            if ((int32_t)(xTaskGetTickCount() - next_edge) >= 0) {
+                lens_on = !lens_on;
+                effective_duty = lens_on ? 100 : 0;
+                next_edge += pdMS_TO_TICKS(FCC_LENS_PULSE_MS);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+    ESP_LOGW(TAG, "FCC: continuous adv stopped (%s)",
+             fcc_stop_req ? "magnet tap" : "duration elapsed");
+
+    fcc_adv_active = false;
+    fcc_stop_req   = false;
+    effective_duty = 0;
+    session_duration_ms = saved_session_ms;
+
+    /* Back to production advertising params (all three channels, 100-200 ms,
+     * connectable) and re-arm the normal idle window. */
+    {
+        int rc = ble_gap_adv_stop();
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "FCC: adv_stop (restore) rc=%d", rc);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        start_advertising();
+        ble_adv_reset_deadline();
+    }
+    ESP_LOGW(TAG, "FCC: normal advertising restored — reconnect to reconfigure");
+}
+
 static void fcc_task(void *param) {
     (void)param;
     while (1) {
@@ -4949,6 +5108,10 @@ static void fcc_task(void *param) {
         if (fcc_start_req) {
             fcc_start_req = false;
             fcc_dtm_run();
+        }
+        if (fcc_adv_start_req) {
+            fcc_adv_start_req = false;
+            fcc_adv_run();
         }
     }
 }
@@ -4999,6 +5162,17 @@ static void ota_task(void *param) {
  *   0xC0  DEBUG : ADC scan enable/disable         (1 arg)
  *   0xC1  NARBIS: forget earclip + rescan         (0 arg) [Path B]
  *   0xC7  BATT  : 0=emit 0xFB frame, 1=reprobe    (1 arg) [v4.16.0]
+ *
+ * FCC test build only (FCC_TEST_BUILD=1 — absent from production binaries):
+ *   0xAE  FCC   : DTM channel 0..39                (1 arg)
+ *   0xAF  FCC   : DTM/BLE tx power level 0..7      (1 arg)
+ *   0xBB  FCC   : START DTM, arg = minutes         (1 arg)
+ *   0xC6  FCC   : report DTM + adv state           (1 arg)
+ *   0xD1  FCC   : adv channel 37/38/39, 0=all      (1 arg) [v4.16.4]
+ *   0xD2  FCC   : adv interval, arg × 5 ms         (1 arg) [v4.16.4]
+ *   0xD3  FCC   : START cont. adv, arg = minutes   (1 arg) [v4.16.4]
+ *                 (0xFF = stop a run in progress)
+ *   0xD4  FCC   : adv PDU 0=NONCONN_IND 1=ADV_IND  (1 arg) [v4.16.4]
  *
  * The legacy single-byte form (len == 1) is treated as static-mode duty
  * — kept for backwards-compat with the earliest dashboard.
@@ -5113,11 +5287,88 @@ static void process_command(uint8_t *data, uint16_t len) {
             if (fcc_task_handle) xTaskNotifyGive(fcc_task_handle);
             break;
 
+        /* ── Continuous advertising (v4.16.4) — see the FCC ADV state block.
+         * Three 2-byte commands rather than one packed frame, so the manual
+         * controller can drive them with its existing 2-byte sendConfig(). */
+        case 0xD1:  /* Advertising channel. arg = LL channel index 37/38/39
+                     * (2402/2426/2480 MHz), or 0 for all three. Converted to
+                     * the HCI channel_map bitmask. Takes effect on the next
+                     * 0xD3; does not disturb a run already going. */
+            if (arg == 0) {
+                fcc_adv_chanmap = 0x07;
+                ble_log("FCC adv: all 3 primary channels");
+            } else if (arg >= 37 && arg <= 39) {
+                fcc_adv_chanmap = (uint8_t)(1u << (arg - 37));
+                ble_log("FCC adv: ch%u = %lu MHz", (unsigned)arg,
+                        (unsigned long)fcc_adv_mhz_of(fcc_adv_chanmap));
+            } else {
+                ble_log("FCC adv: bad channel %u (want 37/38/39, or 0 = all)",
+                        (unsigned)arg);
+            }
+            break;
+
+        case 0xD2:  /* Advertising interval, arg × 5 ms (arg 20 = 100 ms, the
+                     * production worst case and the default). Clamped to the
+                     * 20 ms / 10.24 s window ble_gap_adv_validate() enforces —
+                     * outside it ble_gap_adv_start() returns BLE_HS_EINVAL and
+                     * the device would silently stop advertising. */
+            {
+                uint32_t ms = (uint32_t)arg * 5u;
+                uint32_t units = (ms * 8u) / 5u;          /* ms → 0.625 ms units */
+                if (units < FCC_ADV_ITVL_MIN) units = FCC_ADV_ITVL_MIN;
+                if (units > FCC_ADV_ITVL_MAX) units = FCC_ADV_ITVL_MAX;
+                fcc_adv_itvl = (uint16_t)units;
+                ble_log("FCC adv: interval %lu ms",
+                        (unsigned long)fcc_adv_ms_of(fcc_adv_itvl));
+            }
+            break;
+
+        case 0xD3:  /* START continuous advertising for arg minutes (1-60,
+                     * 0 = default 20). Deferred to fcc_task for the same
+                     * reason as 0xBB: this runs in the NimBLE host task and
+                     * the mode restarts advertising / terminates the link.
+                     * arg 0xFF is the escape hatch — stop a run in progress
+                     * (only reachable in the connectable variant). */
+            if (arg == 0xFF) {
+                if (!fcc_adv_active) { ble_log("FCC adv: not running"); break; }
+                fcc_stop_req = true;
+                ble_log("FCC adv: stopping");
+                break;
+            }
+            if (fcc_adv_active) { ble_log("FCC adv: already running"); break; }
+            if (fcc_dtm_active) { ble_log("FCC adv: DTM is running"); break; }
+            if (arg == 0) arg = FCC_ADV_DEFAULT_MINUTES;
+            if (arg > 60) arg = 60;
+            fcc_adv_minutes = arg;
+            ble_log("FCC adv: starting %lu MHz, %lu ms, %u min, %s — link drops now",
+                    (unsigned long)fcc_adv_mhz_of(fcc_adv_chanmap),
+                    (unsigned long)fcc_adv_ms_of(fcc_adv_itvl), (unsigned)arg,
+                    fcc_adv_conn ? "ADV_IND" : "ADV_NONCONN_IND");
+            fcc_adv_start_req = true;
+            if (fcc_task_handle) xTaskNotifyGive(fcc_task_handle);
+            break;
+
+        case 0xD4:  /* Advertising PDU type: 0 = ADV_NONCONN_IND (default),
+                     * 1 = ADV_IND (connectable, so the run can be stopped over
+                     * BLE — but anything that connects also stops advertising
+                     * and a scanner can draw a SCAN_RSP into the measurement). */
+            fcc_adv_conn = (arg != 0);
+            ble_log("FCC adv: %s", fcc_adv_conn ? "ADV_IND (connectable)"
+                                                : "ADV_NONCONN_IND");
+            break;
+
         case 0xC6:  /* Report current FCC state (human-readable, 0xF1 frames). */
             ble_log("FCC state: ch%u %lu MHz, %+d dBm (lvl %u/7), %u min, DTM %s",
                     (unsigned)fcc_channel, (unsigned long)fcc_mhz_of(fcc_channel),
                     fcc_dbm_of(fcc_pwr_lvl), (unsigned)fcc_pwr_lvl, (unsigned)fcc_minutes,
                     fcc_dtm_active ? "RUNNING" : "idle");
+            ble_log("FCC adv: map 0x%02X (%lu MHz), %lu ms, %u min, %s, %s",
+                    (unsigned)fcc_adv_chanmap,
+                    (unsigned long)fcc_adv_mhz_of(fcc_adv_chanmap),
+                    (unsigned long)fcc_adv_ms_of(fcc_adv_itvl),
+                    (unsigned)fcc_adv_minutes,
+                    fcc_adv_conn ? "ADV_IND" : "ADV_NONCONN_IND",
+                    fcc_adv_active ? "RUNNING" : "idle");
             break;
 #endif /* FCC_TEST_BUILD */
 
@@ -5923,6 +6174,22 @@ static void start_advertising(void) {
     params.itvl_min  = ADV_INT_MIN;
     params.itvl_max  = ADV_INT_MAX;
 
+#if FCC_TEST_BUILD
+    /* v4.16.4: the override lives HERE rather than in a separate entry point
+     * so every path that (re)starts advertising — on_ble_sync, the DISCONNECT
+     * handler, ble_adv_rearm — picks it up without duplicating the params.
+     * The adv payload set above is untouched: the burst stays 32 B / 256 us. */
+    if (fcc_adv_active) {
+        params.conn_mode   = fcc_adv_conn ? BLE_GAP_CONN_MODE_UND
+                                          : BLE_GAP_CONN_MODE_NON;
+        params.disc_mode   = fcc_adv_conn ? BLE_GAP_DISC_MODE_GEN
+                                          : BLE_GAP_DISC_MODE_NON;
+        params.itvl_min    = fcc_adv_itvl;
+        params.itvl_max    = fcc_adv_itvl;    /* min == max: fixed period */
+        params.channel_map = fcc_adv_chanmap; /* 0 would mean all three */
+    }
+#endif
+
     rc = ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER,
                            &params, ble_gap_event_cb, NULL);
     if (rc == 0) {
@@ -6152,6 +6419,13 @@ static void ble_host_task(void *param) {
 static bool nimble_port_initialized = false;
 
 static void ble_adv_reset_deadline(void) {
+#if FCC_TEST_BUILD
+    /* v4.16.4: a chamber run must not be cut short by the idle window. One
+     * guard here covers every caller, including the DISCONNECT path that the
+     * mode's own ble_gap_terminate() triggers. 0 disables the check in the
+     * ble_idle_deadline_tick != 0 test at the bottom of the monitor loop. */
+    if (fcc_adv_active) { ble_idle_deadline_tick = 0; return; }
+#endif
     ble_idle_deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(BLE_IDLE_TIMEOUT_MS);
 }
 
