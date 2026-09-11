@@ -1673,11 +1673,35 @@
  *   behave exactly as before, the dispatch path is shared, no attribute
  *   handle changes, and slave latency / idle power are untouched (this is not
  *   the latency-0 change — that would cost connected power and is not done
- *   here). See the 0xFF01 entry in DASHBOARD_CHRS. */
+ *   here). See the 0xFF01 entry in DASHBOARD_CHRS.
+ *
+ * v4.16.4 — FIX: panic ~30 s after the BLE idle teardown ("the 2-minute reset").
+ *   After BLE_IDLE_TIMEOUT_MS with no client the stack tears down correctly,
+ *   then the device panicked, rebooted and came straight back up advertising —
+ *   so the idle radio saving (~43 mA measured) never materialised. Bench
+ *   forensics (reset reason persisted to NVS across the reboot) showed
+ *   reset=PANIC with the teardown already complete, i.e. the crash came from
+ *   whatever ran next. batt_emit_frame() called
+ *   ble_gatts_chr_updated(batt_bas_handle) with no stack guard: the handle is
+ *   populated once at GATT registration and was never cleared, so batt_task's
+ *   next 30 s emit called into a GATT server nimble_port_deinit() had already
+ *   freed. Fix: guard on ble_stack_up, and clear batt_bas_handle in
+ *   ble_stack_teardown() BEFORE nimble_port_stop() — batt_task is unpinned
+ *   and can run on the other core during the ms-long deinit, so a clear
+ *   placed after it would leave a window. send_status_frame() in the same
+ *   function was already safe: the DISCONNECT handler clears g_conn_handle
+ *   and notifications_enabled before the idle teardown is even eligible (it
+ *   requires !is_connected), and nimble_notify() bails on 0xFFFF. Confirmed
+ *   on a bench build carrying the same guard (reset=PANIC -> reset=SW, radio
+ *   stays down); the NVS reset-reason forensics that found it live on a side
+ *   branch, not in this image. Also rescues FCC_TEST_BUILD: its DTM path
+ *   calls ble_stack_teardown() and holds the host down for minutes, so any
+ *   FCC build >= 4.16.0 would have panicked 30 s into every run by the same
+ *   mechanism. No behaviour change while connected. */
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.16.3-FCC-TEST"
+#define FIRMWARE_VERSION "4.16.4-teardown-crashfix-FCC-TEST"
 #else
-#define FIRMWARE_VERSION "4.16.3-wnr"
+#define FIRMWARE_VERSION "4.16.4-teardown-crashfix"
 #endif
 static const char *TAG = "SG_v4.14.39";
 
@@ -3683,8 +3707,9 @@ static bool batt_probe(void) {
 }
 
 /* Emit the 0xFB frame (and push the BAS characteristic). Safe to call from
- * any task; send_status_frame gates on connection + subscription itself and
- * ble_gatts_chr_updated no-ops without a subscribed client. */
+ * any task; send_status_frame gates on connection + subscription itself
+ * (nimble_notify() bails on g_conn_handle == 0xFFFF), and the BAS push below
+ * is gated on the host actually being up. */
 static void batt_emit_frame(void) {
     uint8_t payload[4];
     payload[0] = (uint8_t)(batt_mv & 0xFF);
@@ -3692,7 +3717,15 @@ static void batt_emit_frame(void) {
     payload[2] = batt_soc;
     payload[3] = batt_charging;
     send_status_frame(BATT_FRAME_TYPE, payload, sizeof(payload));
-    if (batt_bas_handle != 0 && batt_soc != BATT_SOC_UNKNOWN) {
+    /* v4.16.4 FIX — THE 2-MINUTE RESET. This call had no stack guard.
+     * batt_bas_handle is populated once when the GATT table is registered and
+     * was never cleared, so after the BLE idle timeout tore the stack down,
+     * batt_task's next emit (every 30 s) called into a GATT server whose
+     * structures nimble_port_deinit() had already freed -> panic -> reboot ->
+     * straight back to advertising. The radio DID tear down correctly; it
+     * crashed a few seconds later. ble_gatts_chr_updated() no-ops without a
+     * subscribed client, but only on a live host. */
+    if (ble_stack_up && batt_bas_handle != 0 && batt_soc != BATT_SOC_UNKNOWN) {
         ble_gatts_chr_updated(batt_bas_handle);
     }
 }
@@ -6226,6 +6259,14 @@ static esp_err_t ble_stack_teardown(void) {
      * time BLE is re-armed (boot, hall wake/tap). NB: the earclip central is
      * dormant (EARCLIP_CENTRAL_ENABLED=0) so the deinit doesn't disrupt it;
      * if it is ever re-enabled, the re-arm path must also re-init the central. */
+    /* v4.16.4: drop the cached BAS val_handle BEFORE the host goes down, not
+     * after. batt_task is unpinned and can run on the other core, so a 30 s
+     * emit landing inside the ms-long nimble_port_deinit() below would
+     * otherwise pass its guard on a half-freed host. Cleared here, any emit
+     * that starts from now on skips the push; one already past the guard is
+     * microseconds long and finishes while nimble_port_stop() is still
+     * round-tripping the host task. Nothing on the re-arm path reads this. */
+    batt_bas_handle = 0;
     int rc = nimble_port_stop();
     if (rc == 0) {
         esp_err_t derr = nimble_port_deinit();
@@ -6238,6 +6279,12 @@ static esp_err_t ble_stack_teardown(void) {
     }
 
     ble_stack_up = false;
+    /* v4.16.4: cleared again after the deinit for symmetry with the flags
+     * around it; the load-bearing clear is the one above nimble_port_stop().
+     * A cold re-init repopulates it asynchronously — ble_gatts_start() on the
+     * host task writes *val_handle during ble_hs_start(), not
+     * ble_gatts_add_svcs(). */
+    batt_bas_handle = 0;
     is_connected = false;
     g_conn_handle = 0xFFFF;
     notifications_enabled = false;
