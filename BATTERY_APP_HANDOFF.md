@@ -216,6 +216,14 @@ or "—", never to a spinner.
 
 ## 7. Standalone lens pacing — settings UI (please implement)
 
+> **⚠️ SUPERSEDED as of firmware v4.17.0** — see
+> `STANDALONE_PROGRAMS_APP_HANDOFF.md`. The three-program cycle described below
+> no longer exists: the glasses now run one standalone program (Breathe at the
+> saved pace) and a quick close-and-reopen of the arm does nothing. The pacing
+> opcodes in §7.2 are all still correct and still persist; only the "Program 1 /
+> 2 / 3" framing and the tap-to-cycle behavior have changed. Read §7.2, then go
+> to the new document for what to build.
+
 ### 7.1 Confirmed behavior
 
 I verified this against the firmware source this session, and it works the way
@@ -287,6 +295,12 @@ same section — they have the same persist-and-run-standalone character.
 
 ## 8. Startup behavior change in v4.16.1 (affects your copy/screenshots)
 
+> **⚠️ PARTLY SUPERSEDED by firmware v4.17.0.** The removal of the Program-1
+> startup pulse described here still holds. The rest — "2 pulses = Program 2,
+> 3 pulses = Program 3" — applies only to firmware < 4.17.0. On v4.17.0+ a quick
+> close-and-reopen does nothing unless an app has explicitly enabled a
+> multi-program cycle. See `STANDALONE_PROGRAMS_APP_HANDOFF.md` §1.
+
 The glasses used to pulse the lenses once, a couple of seconds after opening, to
 indicate "Program 1". **That pulse is gone.** Opening the glasses now goes
 directly into breathing at the saved pace, with no indicator.
@@ -334,6 +348,10 @@ If B1 or B4 fails on real V1.2 hardware, that is a firmware/curve issue — repo
 it back with raw `mv` values rather than adjusting the app.
 
 ### 9.3 Pacer
+
+> **⚠️ Rows C1–C6 and D1–D4 are superseded on firmware v4.17.0+** by
+> `STANDALONE_PROGRAMS_APP_HANDOFF.md` §7. C1–C3, C5 and C6 still pass as
+> written; C4 and every D row assume the old tap-to-cycle behavior.
 
 | # | Test | PASS |
 |---|---|---|
