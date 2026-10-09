@@ -1675,7 +1675,7 @@
  *   the latency-0 change — that would cost connected power and is not done
  *   here). See the 0xFF01 entry in DASHBOARD_CHRS. */
 #if FCC_TEST_BUILD
-#define FIRMWARE_VERSION "4.16.4-FCC-TEST"
+#define FIRMWARE_VERSION "4.16.5-FCC-TEST"
 #else
 #define FIRMWARE_VERSION "4.16.3-wnr"
 #endif
@@ -3744,8 +3744,12 @@ static bool batt_probe(void) {
 }
 
 /* Emit the 0xFB frame (and push the BAS characteristic). Safe to call from
- * any task; send_status_frame gates on connection + subscription itself and
- * ble_gatts_chr_updated no-ops without a subscribed client. */
+ * any task; send_status_frame gates on connection + subscription itself.
+ *
+ * The old comment here claimed ble_gatts_chr_updated() "no-ops without a
+ * subscribed client". That is true of an UNSUBSCRIBED client and false of a
+ * DEINITIALISED host, and the difference is what crashed the device -- see
+ * the guard below. */
 static void batt_emit_frame(void) {
     uint8_t payload[4];
     payload[0] = (uint8_t)(batt_mv & 0xFF);
@@ -3753,7 +3757,31 @@ static void batt_emit_frame(void) {
     payload[2] = batt_soc;
     payload[3] = batt_charging;
     send_status_frame(BATT_FRAME_TYPE, payload, sizeof(payload));
-    if (batt_bas_handle != 0 && batt_soc != BATT_SOC_UNKNOWN) {
+    /* v4.16.5-FCC-TEST -- PORT OF THE PRODUCTION 2-MINUTE PANIC FIX (f551a99,
+     * shipped on main as v4.17.1 / PR #48). This call had no stack guard.
+     * batt_bas_handle is populated once when the GATT table is registered and
+     * was never cleared, so after ble_stack_teardown() ran nimble_port_deinit()
+     * -> esp_nimble_deinit(), batt_task's next emit (every 30 s) reached into a
+     * GATT server whose structures had already been freed -> panic -> reboot ->
+     * straight back to advertising.
+     *
+     * Why this matters for FCC specifically, and why it was not caught sooner:
+     * the teardown happens in exactly two places the lab exercises. fcc_dtm_run()
+     * calls ble_stack_teardown() outright before taking the controller over for
+     * DTM, and the BLE_IDLE_TIMEOUT_MS window (600000 ms in this build) fires
+     * when a unit sits powered on with nothing connected. So on hardware where
+     * the battery monitor is live, every DTM run would panic about 30 s in, and
+     * an idle unit would reboot roughly every 10.5 minutes. It went unnoticed
+     * because the earlier FCC builds (4.15.x) had no batt_task at all, and
+     * because it is silent on V1.1 boards: with no VBAT divider fitted the probe
+     * fails, batt_soc stays BATT_SOC_UNKNOWN and the call below is never reached.
+     * The units at the test lab DO have the divider, so none of that protects
+     * them.
+     *
+     * send_status_frame() above is safe -- nimble_notify() already returns early
+     * on g_conn_handle == 0xFFFF, which the teardown sets. Only this
+     * GATT-server call was exposed. */
+    if (ble_stack_up && batt_bas_handle != 0 && batt_soc != BATT_SOC_UNKNOWN) {
         ble_gatts_chr_updated(batt_bas_handle);
     }
 }
@@ -6517,6 +6545,12 @@ static esp_err_t ble_stack_teardown(void) {
     notifications_enabled = false;
     ppg_notifications_enabled = false;
     ble_idle_deadline_tick = 0;
+    /* v4.16.5-FCC-TEST: belt and braces with the ble_stack_up guard in
+     * batt_emit_frame(). The handle belonged to a GATT table that
+     * nimble_port_deinit() has just freed; leaving it set invites the next
+     * caller to dereference it. ble_stack_init() repopulates it via
+     * ble_gatts_add_svcs() on the next cold re-init. */
+    batt_bas_handle = 0;
     return ESP_OK;
 }
 
